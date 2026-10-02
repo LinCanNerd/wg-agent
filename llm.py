@@ -126,7 +126,12 @@ def has_number(text: str, phone: str) -> bool:
 BAD_SENTENCE = re.compile(
     r"\bich wohne (in|im|am|an|bei|nahe|gerade|derzeit|zurzeit|aktuell|schon)\b|\bwohne ich (in|im|am|an)\b|"
     r"\bda ich (in|im|am) [^.!?]{0,40}\bwohne\b|\bi (currently )?live (in|near|at)\b|"
-    r"keine angaben|kann ich (leider )?nicht(s)? sagen|can'?t (say|tell|share)|no information",
+    r"keine angaben|kann ich (leider )?nicht(s)? sagen|can'?t (say|tell|share)|no information|"
+    # remarks about the flatmates' origin, and "I'd be happy to move in" filler: the fixed text says it
+    r"\b(jemand|leute[n]?|mitbewohner\w*|someone|people|flatmates?)\b[^.!?]{0,25}\b(aus|from) [^.!?]{0,30}"
+    r"(china|deutschland|ukraine|ländern|countries|land|country|welt|world)|international\w* (wg|flat)|"
+    r"würde mich (sehr |riesig |total )?freuen|freue mich (sehr )?(darauf|auf)|would (be|love) (very |really )?"
+    r"(happy|glad|love)|i'?d love to (move|join|live)",
     re.I,
 )
 
@@ -212,13 +217,17 @@ price/size, WG vibe or studio quality, availability date, and who they are looki
 
 The part you write ("message"):
 - Write ONLY in {language}, even if the ad or my profile uses another language. {register}
-- One or two short, plain sentences (at most 30 words in total) that show I read THEIR ad: take one
-  concrete thing they wrote about themselves, the WG or who they're looking for, and say plainly how it
-  fits me, using a fact from MY PROFILE. Write it the way a normal person types a quick message. For
-  example, only if they say they cook together: "Ihr schreibt, dass ihr oft zusammen kocht, da bin ich
-  gern dabei."; only if the WG is international: "Mit Leuten aus verschiedenen Ländern zusammenzuwohnen
-  gefällt mir."; only if they play sports: "Beim Volleyball wäre ich sofort dabei." Use your own words.
-- If nothing in the ad connects to me, write nothing (empty string): my fixed text works on its own.
+- At most one short, plain sentence (max 20 words), and only if the ad mentions something they do
+  together or a hobby that I share according to MY PROFILE (cooking or eating together, basketball,
+  volleyball, other sports, games, films, manga...). Say that I'd join in, the way a normal person types
+  a quick message, e.g. "Ihr kocht oft zusammen, da bin ich gern dabei." / "Beim Volleyball wäre ich
+  sofort dabei." / "You cook together a lot, count me in." Use your own words.
+- Otherwise write nothing (empty string): my fixed text works on its own, and an empty part is better
+  than a forced one.
+- Never comment on the flatmates themselves: not their nationality or origin, age, gender, studies or
+  jobs (wrong: "Da bereits jemand aus China bei euch wohnt, ...").
+- No filler like "ich würde mich freuen, bei euch einzuziehen" / "I'd love to move in": my fixed text
+  already says I want the room.
 - Don't write about my commute, my job or the location: they don't care how I get to work. Only if the
   ad asks about it.
 - MY FIXED TEXT is shown below: never repeat anything it already says (my age, job, origin, hobbies,
