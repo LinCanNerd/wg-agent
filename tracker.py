@@ -9,9 +9,12 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+from sites import SITE_LABELS
+
 COLUMNS = [
     ("Ad ID", 11),
     ("Status", 11),
+    ("Site", 13),
     ("Sent at", 16),
     ("Replied at", 16),
     ("Type", 8),
@@ -35,6 +38,7 @@ FILL = {
     "already": PatternFill("solid", fgColor="E7E6E6"),
 }
 STATUS_LABEL = {"sent": "sent", "replied": "replied", "already": "contacted before"}
+COL = {name: i for i, (name, _) in enumerate(COLUMNS, 1)}
 
 
 def _ts(t):
@@ -62,6 +66,7 @@ def write_excel(conn, path="applications.xlsx") -> str:
             [
                 r["id"],
                 STATUS_LABEL.get(r["status"], r["status"]),
+                SITE_LABELS.get(d.get("site", "wg-gesucht"), d.get("site")),
                 _ts(r["sent_at"]),
                 _ts(r["reply_at"]),
                 "Studio" if d.get("kind") == "studio" else "WG",
@@ -81,14 +86,14 @@ def write_excel(conn, path="applications.xlsx") -> str:
             ]
         )
         row = ws.max_row
-        ws.cell(row, 15).hyperlink = d.get("url")
-        ws.cell(row, 15).font = Font(color="0563C1", underline="single")
+        ws.cell(row, COL["Link"]).hyperlink = d.get("url")
+        ws.cell(row, COL["Link"]).font = Font(color="0563C1", underline="single")
         if r["conv_url"]:
-            ws.cell(row, 18).hyperlink = r["conv_url"]
-            ws.cell(row, 18).font = Font(color="0563C1", underline="single")
-        ws.cell(row, 2).fill = FILL.get(r["status"], PatternFill())
-        for c in (6, 12, 16, 17):
-            ws.cell(row, c).alignment = Alignment(wrap_text=True, vertical="top")
+            ws.cell(row, COL["Conversation"]).hyperlink = r["conv_url"]
+            ws.cell(row, COL["Conversation"]).font = Font(color="0563C1", underline="single")
+        ws.cell(row, COL["Status"]).fill = FILL.get(r["status"], PatternFill())
+        for name in ("Title", "Commute", "Message sent", "Reply (preview)"):
+            ws.cell(row, COL[name]).alignment = Alignment(wrap_text=True, vertical="top")
     ws.auto_filter.ref = ws.dimensions
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     wb.save(path)

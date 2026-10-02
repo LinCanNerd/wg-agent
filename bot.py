@@ -1,8 +1,9 @@
-"""WG-Gesucht watcher + Telegram approval bot.
+"""Flat-ad watcher (WG-Gesucht, Kleinanzeigen) + Telegram approval bot.
 
 Usage:
-    python bot.py --login     # once: log in to WG-Gesucht in a visible browser
-    python bot.py             # run the agent
+    python bot.py --login             # once: log in to every site you search, in a visible browser
+    python bot.py --login kleinanzeigen   # only one site
+    python bot.py                     # run the agent
 """
 
 import argparse
@@ -27,24 +28,17 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 from commute import Commute
 from guard import BudgetExceeded, CoolingDown, RateGuard
 from llm import LLM, detect_language, first_name, has_number
+from sites import Blocked, Browser, Listing, LoggedOut, Site, interactive_login
 from tracker import looks_like_mine, match_conversation, write_excel
-from wg import (
-    WG,
-    Blocked,
-    Listing,
-    LoggedOut,
-    conversation_ad_id,
-    inbox,
-    interactive_login,
-    listing_from_url,
-    prepare_search_url,
-)
+from wg import WGGesucht
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("agent")
 
 CFG: dict = {}
+SITE_TYPES = (WGGesucht,)
+SITES: dict[str, Site] = {}  # every supported site; only the ones with a search are polled
 
 
 # ---------------- storage ----------------
@@ -58,23 +52,34 @@ class DB:
                  note TEXT, lang TEXT, score INTEGER, draft TEXT, created REAL)"""
         )
         self.c.execute("CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT)")
-        for col in ("fp TEXT", "sent_at REAL", "reply_at REAL", "reply_text TEXT", "conv_url TEXT", "poster_id TEXT"):
+        for col in (
+            "fp TEXT",
+            "sent_at REAL",
+            "reply_at REAL",
+            "reply_text TEXT",
+            "conv_url TEXT",
+            "poster_id TEXT",
+            "site TEXT",  # NULL in rows from before Kleinanzeigen: WG-Gesucht
+        ):
             try:
                 self.c.execute(f"ALTER TABLE listings ADD COLUMN {col}")
             except sqlite3.OperationalError:
                 pass
         self.c.commit()
 
-    def count_kind(self, kind):
-        return self.c.execute("SELECT COUNT(*) FROM listings WHERE data LIKE ?", (f'%"kind": "{kind}"%',)).fetchone()[0]
+    def count_search(self, site, kind):
+        return self.c.execute(
+            "SELECT COUNT(*) FROM listings WHERE COALESCE(site, 'wg-gesucht')=? AND data LIKE ?",
+            (site, f'%"kind": "{kind}"%'),
+        ).fetchone()[0]
 
     def seen(self, lid):
         return self.c.execute("SELECT 1 FROM listings WHERE id=?", (lid,)).fetchone() is not None
 
     def add(self, l: Listing, status="new"):
         self.c.execute(
-            "INSERT OR IGNORE INTO listings(id,url,title,data,status,created) VALUES(?,?,?,?,?,?)",
-            (l.id, l.url, l.title, json.dumps(l.to_dict()), status, time.time()),
+            "INSERT OR IGNORE INTO listings(id,url,title,data,status,created,site) VALUES(?,?,?,?,?,?,?)",
+            (l.id, l.url, l.title, json.dumps(l.to_dict()), status, time.time(), l.site),
         )
         self.c.commit()
 
@@ -132,8 +137,9 @@ class DB:
                     return r
         return None
 
-    def sent_rows(self):
-        return self.c.execute("SELECT * FROM listings WHERE status IN ('sent','replied','already')").fetchall()
+    def sent_rows(self, site=None):
+        rows = self.c.execute("SELECT * FROM listings WHERE status IN ('sent','replied','already')").fetchall()
+        return [r for r in rows if site is None or (r["site"] or "wg-gesucht") == site]
 
     def kv_get(self, k, default=None):
         r = self.c.execute("SELECT v FROM kv WHERE k=?", (k,)).fetchone()
@@ -149,7 +155,10 @@ class DB:
 
 def fingerprint(l: Listing) -> str:
     street = re.sub(r"[^a-zäöüß]", "", (l.address or l.street or "").lower().split("\n")[0])[:25]
-    return f"{l.kind}|{street}|{l.size}|{round((l.rent or 0) / 25)}"
+    fp = f"{l.kind}|{street}|{l.size}|{round((l.rent or 0) / 25)}"
+    if not l.street and l.poster_id:  # only the postcode area is known: too vague without the advertiser
+        fp += f"|{l.poster_id}"
+    return fp
 
 
 # ---------------- filtering ----------------
@@ -162,15 +171,38 @@ def _d(s):
     return None
 
 
-def search_cfg(kind):
-    for s in CFG["search"]["searches"]:
-        if s.get("kind", "room") == kind:
-            return s
-    return {}
+def site_for_url(url) -> Site:
+    for site in SITES.values():
+        if site.handles(url):
+            return site
+    raise ValueError(f"not a supported site ({', '.join(s.label for s in SITES.values())}): {url}")
+
+
+def active_sites() -> list[Site]:
+    """Sites with at least one search in config.yaml."""
+    names = dict.fromkeys(site_for_url(sc["url"]).name for sc in CFG["search"]["searches"])
+    return [SITES[n] for n in names]
+
+
+def site_dry_run(site: Site) -> bool:
+    """sites.<name>.dry_run wins; a site whose sending isn't verified yet stays a dry run by default."""
+    own = (CFG.get("sites") or {}).get(site.name) or {}
+    if "dry_run" in own:
+        return bool(own["dry_run"])
+    return True if not site.send_verified else CFG.get("send", {}).get("dry_run", True)
+
+
+def search_cfg(l: Listing):
+    """The search an ad came from: same site and kind, else the same kind on another site."""
+    same_kind = [sc for sc in CFG["search"]["searches"] if sc.get("kind", "room") == l.kind]
+    for sc in same_kind:
+        if site_for_url(sc["url"]).name == l.site:
+            return sc
+    return same_kind[0] if same_kind else {}
 
 
 def hard_filter(l: Listing, extra_text="") -> str | None:
-    s = {**CFG["search"], **search_cfg(l.kind)}
+    s = {**CFG["search"], **search_cfg(l)}
     if s.get("max_rent") and l.rent and l.rent > s["max_rent"]:
         return f"rent {l.rent} €"
     if s.get("min_size") and l.size and l.size < s["min_size"]:
@@ -228,7 +260,7 @@ def keyboard(lid, l: Listing | None = None):
         ],
     ]
     if l:
-        links = [InlineKeyboardButton("🔗 Ad", url=l.url)]
+        links = [InlineKeyboardButton(f"🔗 {SITES[l.site].label if l.site in SITES else 'Ad'}", url=l.url)]
         if l.lat:
             links.append(
                 InlineKeyboardButton("🗺 Map", url=f"https://www.google.com/maps/search/?api=1&query={l.lat},{l.lng}")
@@ -249,6 +281,8 @@ def keyboard(lid, l: Listing | None = None):
 def card_text(l: Listing, r, meta, with_translation=True):
     e = html.escape
     kind = "🏢 STUDIO" if l.kind == "studio" else "🏠 WG"
+    if len(active_sites()) > 1 and l.site in SITES:
+        kind += f" · {SITES[l.site].label}"
     lines = [
         f"{kind} <b>{e(l.title or 'Angebot')}</b>",
         f"💶 {l.rent or '?'} € · 📐 {l.size or '?'} m² · 📍 {e(l.address or (l.street + ', ' + l.district))}",
@@ -400,11 +434,14 @@ FILTER_REASONS = [  # how hard_filter / commute notes start -> words for the dai
 def summary_text(hours=24):
     since = time.time() - hours * 3600
     rows = DB_.c.execute(
-        "SELECT status, score, note FROM listings WHERE created > ? AND status <> 'preexisting'", (since,)
+        "SELECT status, score, note, COALESCE(site, 'wg-gesucht') AS site FROM listings "
+        "WHERE created > ? AND status NOT IN ('preexisting', 'test')",
+        (since,),
     ).fetchall()
-    by = {}
+    by, per_site = {}, {}
     for r in rows:
         by[r["status"]] = by.get(r["status"], 0) + 1
+        per_site[r["site"]] = per_site.get(r["site"], 0) + 1
     reasons = {}
     for r in rows:
         if r["status"] == "filtered":
@@ -420,9 +457,11 @@ def summary_text(hours=24):
     best = max((r["score"] for r in cards if r["score"] is not None), default=None)
 
     top = ", ".join(f"{n} {lbl}" for lbl, n in sorted(reasons.items(), key=lambda x: -x[1])[:4])
+    sites = active_sites()
+    split = ", ".join(f"{s.label} {per_site.get(s.name, 0)}" for s in sites)
     lines = [
         f"📋 <b>Daily review</b> ({datetime.now():%a %d %b}, last {hours} h)",
-        f"• New ads: {len(rows)}",
+        f"• New ads: {len(rows)}" + (f" ({split})" if len(sites) > 1 else ""),
         f"• Filtered out automatically: {by.get('filtered', 0)}" + (f" ({top})" if top else ""),
         f"• Reposts / already contacted: {by.get('repost', 0) + by.get('same_person', 0)}",
         f"• Below your minimum score: {by.get('low_score', 0)}",
@@ -436,7 +475,7 @@ def summary_text(hours=24):
             f"• Not processed: {by.get('stale', 0)} too old in the queue, {by.get('error', 0)} errors, "
             f"{by.get('gone', 0)} taken offline first"
         )
-    lines.append(f"• WG-Gesucht {html.escape(GUARD.status())}")
+    lines += [f"• {s.label} {html.escape(s.guard.status())}" for s in sites]
     if events:
         lines.append(f"• Agent notes ({len(events)}):")
         lines += [f"   – {datetime.fromtimestamp(ev['t']):%H:%M} {html.escape(ev['text'][:160])}" for ev in events[-5:]]
@@ -453,7 +492,7 @@ async def daily_summary(ctx: ContextTypes.DEFAULT_TYPE):
 async def process(bot, l: Listing, force=False):
     """Details -> filters -> commute -> LLM -> Telegram card. force=True skips filters (for /test)."""
     try:
-        await WG_.fetch_details(l)
+        await SITES[l.site].fetch_details(l)
     except LookupError as e:
         DB_.update(l.id, status="gone", note=str(e))
         if force:
@@ -501,7 +540,7 @@ async def process(bot, l: Listing, force=False):
     meta = {k: out.get(k) for k in ("reasons", "red_flags", "keyword", "keyword_at_start", "questions", "notes")}
     meta["warnings"] = warnings
     DB_.update(l.id, lang=lang, score=out["score"], draft=out["message"], note=json.dumps(meta))
-    min_score = search_cfg(l.kind).get("min_score", CFG["search"].get("min_score", 0))
+    min_score = search_cfg(l).get("min_score", CFG["search"].get("min_score", 0))
     if not force and out["score"] < min_score:
         DB_.update(l.id, status="low_score")
         log.info("low score %s: %s (%s)", l.id, out["score"], out["reasons"])
@@ -517,8 +556,9 @@ def next_delay():
     night = n0 <= datetime.now().hour < n1
     base = p.get("night_interval_seconds", 900) if night else p.get("interval_seconds", 120)
     d = base + random.uniform(0, p.get("jitter_seconds", 0))
-    if GUARD.cooling_left():
-        d = max(d, GUARD.cooling_left() + random.uniform(30, 120))
+    cooling = [s.guard.cooling_left() for s in active_sites()]
+    if cooling and all(cooling):  # every site is cooling down: wait for the first to finish
+        d = max(d, min(cooling) + random.uniform(30, 120))
     return d
 
 
@@ -532,75 +572,93 @@ async def tick(ctx: ContextTypes.DEFAULT_TYPE):
         ctx.job_queue.run_once(tick, next_delay(), name="poll")
 
 
-async def on_block(bot, why):
-    wait = GUARD.strike()
+async def on_block(bot, site: Site, why):
+    wait = site.guard.strike()
     await notify(
         bot,
-        f"🛑 WG-Gesucht pushed back ({why}). Cooling down {wait // 60} min "
-        f"(strike {GUARD.strikes}). Nothing to do; I'll resume by myself.",
+        f"🛑 {site.label} pushed back ({why}). Cooling down {wait // 60} min "
+        f"(strike {site.guard.strikes}). Nothing to do; I'll resume by myself.",
     )
+
+
+async def on_budget(bot, st, site: Site):
+    hour = datetime.now().strftime("%Y-%m-%d %H")
+    log.warning("%s page budget reached: %s", site.label, site.guard.status())
+    if st["budget_warned"].get(site.name) != hour:
+        st["budget_warned"][site.name] = hour
+        await notify(
+            bot,
+            f"⏳ Hit my own safety budget for {site.label} ({site.guard.status()}). "
+            "Skipping its checks until it frees up.",
+        )
+
+
+async def site_trouble(bot, st, site: Site, e) -> bool:
+    """Handles a block / budget / cooldown of one site; True if it was one (the site sits out this poll)."""
+    if isinstance(e, Blocked):
+        await on_block(bot, site, e)
+    elif isinstance(e, BudgetExceeded):
+        await on_budget(bot, st, site)
+    elif not isinstance(e, CoolingDown):
+        return False
+    return True
 
 
 async def poll_once(ctx: ContextTypes.DEFAULT_TYPE):
     st = ctx.bot_data
-    if st["paused"] or GUARD.cooling_left() or st["poll_lock"].locked():
+    if st["paused"] or st["poll_lock"].locked():
         return
     async with st["poll_lock"]:
-        try:
-            await _poll(ctx, st)
-        except Blocked as e:
-            await on_block(ctx.bot, e)
-        except CoolingDown:
-            pass
-        except BudgetExceeded:
-            hour = datetime.now().strftime("%Y-%m-%d %H")
-            log.warning("page budget reached: %s", GUARD.status())
-            if st.get("budget_warned") != hour:
-                st["budget_warned"] = hour
-                await notify(
-                    ctx.bot, f"⏳ Hit my own safety budget ({GUARD.status()}). Skipping checks until it frees up."
-                )
+        await _poll(ctx, st)
 
 
 async def _poll(ctx, st):
     p = CFG["poll"]
     st["n"] += 1
+    resting = set()  # sites that pushed back, ran out of budget or are cooling down: skipped this poll
     due = [s for s in CFG["search"]["searches"] if (st["n"] - 1) % max(1, int(s.get("every_n_polls", 1))) == 0]
     for i, sc in enumerate(due):
+        site = site_for_url(sc["url"])
+        if site.name in resting or site.guard.cooling_left():
+            resting.add(site.name)
+            continue
         if i:
             await asyncio.sleep(random.uniform(8, 20))
         kind = sc.get("kind", "room")
-        url = prepare_search_url(sc["url"], sc.get("max_rent"), CFG["search"].get("min_size"))
+        key = f"{site.name}/{kind}"
+        url = site.prepare_search_url(sc["url"], sc.get("max_rent"), CFG["search"].get("min_size"))
         try:
-            listings = await WG_.search(url, kind)
-        except (Blocked, BudgetExceeded, CoolingDown):
-            raise
+            listings = await site.search(url, kind)
         except Exception as e:
-            log.exception("search failed")
-            st["fails"] += 1
-            if st["fails"] == 3:
-                await notify(ctx.bot, f"⚠️ Search failing repeatedly: {e}")
-            return
-        st["fails"] = 0
-        # Soft-block detection: a search that normally has results suddenly returns none, twice.
-        prev = st["counts"].get(kind, 0)
-        if not listings and prev >= 5:
-            st["zeros"][kind] = st["zeros"].get(kind, 0) + 1
-            if st["zeros"][kind] >= 2:
-                st["zeros"][kind] = 0
-                raise Blocked("search suddenly returns nothing")
+            if await site_trouble(ctx.bot, st, site, e):
+                resting.add(site.name)
+                continue
+            log.exception("%s search failed", site.label)
+            st["fails"][key] = st["fails"].get(key, 0) + 1
+            if st["fails"][key] == 3:
+                await notify(ctx.bot, f"⚠️ {site.label} search failing repeatedly: {e}")
             continue
-        st["zeros"][kind] = 0
-        st["counts"][kind] = len(listings)
+        st["fails"][key] = 0
+        # Soft-block detection: a search that normally has results suddenly returns none, twice.
+        prev = st["counts"].get(key, 0)
+        if not listings and prev >= 5:
+            st["zeros"][key] = st["zeros"].get(key, 0) + 1
+            if st["zeros"][key] >= 2:
+                st["zeros"][key] = 0
+                await on_block(ctx.bot, site, "search suddenly returns nothing")
+                resting.add(site.name)
+            continue
+        st["zeros"][key] = 0
+        st["counts"][key] = len(listings)
         st["last_poll"] = datetime.now().strftime("%H:%M:%S")
 
         new = [l for l in listings if not DB_.seen(l.id)]
-        if not st["seeded"].get(kind) and p.get("skip_existing_on_start") and DB_.count_kind(kind) == 0:
+        if not st["seeded"].get(key) and p.get("skip_existing_on_start") and DB_.count_search(site.name, kind) == 0:
             for l in new:
                 DB_.add(l, status="preexisting")
-            log.info("marked %d existing %s listings as seen", len(new), kind)
+            log.info("marked %d existing %s listings as seen", len(new), key)
             new = []
-        st["seeded"][kind] = True
+        st["seeded"][key] = True
         for l in new:
             DB_.add(l, status="queued")
             if why := hard_filter(l):  # cheap check on the card, no extra page load
@@ -610,13 +668,17 @@ async def _poll(ctx, st):
     DB_.expire_queue(hours=24)
     for r in DB_.queued(int(p.get("max_details_per_poll", 3))):
         l = Listing.from_dict(json.loads(r["data"]))
+        site = SITES[l.site]
+        if site.name in resting or site.guard.cooling_left():
+            continue
         await asyncio.sleep(random.uniform(6, 15))
         try:
             await process(ctx.bot, l)
-        except (Blocked, BudgetExceeded, CoolingDown):
-            DB_.update(l.id, status="queued")  # retry later
-            raise
         except Exception as e:
+            if await site_trouble(ctx.bot, st, site, e):
+                DB_.update(l.id, status="queued")  # retry later
+                resting.add(site.name)
+                continue
             log.exception("process failed")
             DB_.update(l.id, status="error", note=str(e)[:500])
 
@@ -625,14 +687,6 @@ async def _poll(ctx, st):
 async def inbox_tick(ctx: ContextTypes.DEFAULT_TYPE):
     try:
         await check_replies(ctx.bot)
-    except LoggedOut:
-        await notify(
-            ctx.bot, "⚠️ Can't read your inbox: logged out of WG-Gesucht. Run python bot.py --login.", important=True
-        )
-    except Blocked as e:
-        await on_block(ctx.bot, e)
-    except (BudgetExceeded, CoolingDown):
-        pass
     except Exception:
         log.exception("reply check failed")
     finally:
@@ -643,28 +697,51 @@ async def inbox_tick(ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def check_replies(bot):
-    if ctx_paused(bot) or GUARD.cooling_left() or not DB_.sent_rows():
+    """Read the inbox of every site I've sent messages on."""
+    if ctx_paused(bot):
         return
-    convs = await inbox(WG_)
-    first_run = not DB_.kv_get("inbox_baseline", False)
+    for site in SITES.values():
+        sent = DB_.sent_rows(site.name)
+        if not sent or site.guard.cooling_left():
+            continue
+        try:
+            await check_site_replies(bot, site, sent)
+        except LoggedOut:
+            await notify(
+                bot,
+                f"⚠️ Can't read your {site.label} inbox: logged out. Run python bot.py --login {site.name}.",
+                important=True,
+            )
+        except (Blocked, BudgetExceeded, CoolingDown) as e:
+            await site_trouble(bot, APP.bot_data, site, e)
+
+
+async def check_site_replies(bot, site: Site, sent):
+    convs = await site.inbox()
+    # WG-Gesucht keeps the key it had before there were other sites
+    baseline = "inbox_baseline" if site.name == "wg-gesucht" else f"inbox_baseline:{site.name}"
+    first_run = not DB_.kv_get(baseline, False)
     names = set(DB_.kv_get("inbox_names", []) or [])
     names.update(c["name"] for c in convs if c.get("name"))
     DB_.kv_set("inbox_names", sorted(names))
-    sent = DB_.sent_rows()
     drafts = [r["draft"] or "" for r in sent]
     changed = False
     for c in convs:
-        key = "conv:" + c["href"].split("nachrichten-id=")[-1].split("&")[0]
+        key = c["key"]
         sig = f"{c['when']}|{c['text'][-200:]}"
         if DB_.kv_get(key) == sig:
             continue
         DB_.kv_set(key, sig)
-        if looks_like_mine(c["text"], drafts):
+        mine = c.get("mine")
+        if mine or (mine is None and looks_like_mine(c["text"], drafts)):
             continue  # the newest message in that chat is my own
-        rows = match_conversation(c, sent)
-        if len(rows) != 1:  # ambiguous / unknown: open the chat once to read the ad id
-            ad_id = await conversation_ad_id(WG_, c["href"])
-            rows = [r for r in sent if r["id"] == ad_id] if ad_id else []
+        if c.get("ad_id"):  # the site says which ad the chat is about
+            rows = [r for r in sent if r["id"] == c["ad_id"]]
+        else:
+            rows = match_conversation(c, sent)
+            if len(rows) != 1:  # ambiguous / unknown: open the chat once to read the ad id
+                ad_id = await site.conversation_ad_id(c["href"])
+                rows = [r for r in sent if r["id"] == ad_id] if ad_id else []
         preview = re.sub(r"\s+", " ", c["text"]).strip()[:300]
         if rows:
             r = rows[0]
@@ -680,14 +757,14 @@ async def check_replies(bot):
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("💬 Open chat", url=c["href"])]])
         await bot.send_message(
             CFG["telegram"]["chat_id"],
-            f"💬 <b>{html.escape(c['name'] or 'Someone')}</b> replied"
+            f"💬 <b>{html.escape(c['name'] or 'Someone')}</b> replied on {site.label}"
             f"{' about ' + html.escape(title) if title else ''}\n\n<i>{html.escape(preview)}</i>",
             parse_mode=ParseMode.HTML,
             reply_markup=kb,
             disable_web_page_preview=True,
         )
     if first_run:
-        DB_.kv_set("inbox_baseline", True)
+        DB_.kv_set(baseline, True)
     if changed:
         write_excel(DB_.c, EXCEL)
 
@@ -736,11 +813,12 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         await q.answer("Sending…")
         await q.edit_message_reply_markup(None)
-        dry = CFG.get("send", {}).get("dry_run", True)
+        site = SITES[l.site]
+        dry = site_dry_run(site)
         try:
-            status, shot, info = await WG_.send_message(l, r["draft"], dry_run=dry)
+            status, shot, info = await site.send_message(l, r["draft"], dry_run=dry)
         except LoggedOut:
-            status, shot, info = "failed", None, "Logged out of WG-Gesucht. Run `python bot.py --login`."
+            status, shot, info = "failed", None, f"Logged out of {site.label}. Run `python bot.py --login {site.name}`."
         except CoolingDown as e:
             status, shot, info = (
                 "failed",
@@ -748,8 +826,8 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"Not sending right now: {e} after a block. Try again later or send manually.",
             )
         except Blocked as e:
-            await on_block(ctx.bot, e)
-            status, shot, info = "failed", None, "WG-Gesucht blocked the send page."
+            await on_block(ctx.bot, site, e)
+            status, shot, info = "failed", None, f"{site.label} blocked the send page."
         except Exception as e:
             log.exception("send failed")
             status, shot, info = "failed", None, f"Error: {e}"
@@ -764,7 +842,9 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             caption = "❌ " + caption + "\nThe draft is in the card above – you can copy it and send manually."
             await q.message.edit_reply_markup(keyboard(lid, l))
         elif status == "dry_run":  # keep the card usable: after switching dry_run off, ✅ sends it for real
-            caption = "🧪 " + caption + "\nTo really send it: set send.dry_run: false and restart, then press ✅ again."
+            own = "dry_run" in ((CFG.get("sites") or {}).get(site.name) or {}) or not site.send_verified
+            setting = f"sites.{site.name}.dry_run" if own else "send.dry_run"
+            caption = "🧪 " + caption + f"\nTo really send it: set {setting}: false and restart, then press ✅ again."
             await q.message.edit_reply_markup(keyboard(lid, l))
         if shot and Path(shot).exists():
             with open(shot, "rb") as f:
@@ -823,12 +903,12 @@ async def cmd_summary(update: Update, ctx):
 
 async def cmd_status(update: Update, ctx):
     st = ctx.bot_data
+    sites = "\n".join(f"{s.label}: {s.guard.status()} · dry run: {site_dry_run(s)}" for s in active_sites())
     await update.message.reply_text(
         f"{'⏸ paused' if st['paused'] else '▶️ running'}\n"
         f"Last poll: {st.get('last_poll', '–')} ({st.get('counts', {})} ads on page)\n"
-        f"Next check in ~{int(next_delay() // 60)} min · {GUARD.status()}\n"
+        f"Next check in ~{int(next_delay() // 60)} min\n{sites}\n"
         f"Commute: {'on (' + COMMUTE_.provider + ')' if COMMUTE_.enabled else 'off'}\n"
-        f"Dry run: {CFG.get('send', {}).get('dry_run', True)}\n"
         f"DB: {DB_.stats()}"
     )
 
@@ -844,85 +924,120 @@ async def cmd_resume(update: Update, ctx):
 
 
 async def cmd_check(update: Update, ctx):
-    if GUARD.cooling_left():
-        await update.message.reply_text(
-            f"🧊 Cooling down after a block ({GUARD.cooling_left() // 60} min left), not checking."
-        )
+    cooling = [s.guard.cooling_left() for s in active_sites()]
+    if all(cooling):
+        await update.message.reply_text(f"🧊 Cooling down after a block ({min(cooling) // 60} min left), not checking.")
         return
     await update.message.reply_text("🔎 Checking now…")
     await poll_once(ctx)
 
 
+async def login_lines() -> tuple[list[str], bool]:
+    """One line per searched site (1 page load each), and whether all of them are logged in."""
+    lines, all_ok = [], True
+    for s in active_sites():
+        try:
+            ok = await s.is_logged_in()
+            lines.append(
+                f"✅ {s.label}: logged in" if ok else f"⚠️ {s.label}: NOT logged in – python bot.py --login {s.name}"
+            )
+        except Exception as e:
+            ok = True  # can't tell; don't raise the alarm for that
+            lines.append(f"❔ {s.label}: login check failed ({e.__class__.__name__})")
+        all_ok = all_ok and ok
+    return lines, all_ok
+
+
 async def cmd_login_check(update: Update, ctx):
-    ok = await WG_.is_logged_in()
-    await update.message.reply_text("✅ Logged in" if ok else "❌ Not logged in – run python bot.py --login")
+    lines, _ = await login_lines()
+    await update.message.reply_text("\n".join(lines))
 
 
 async def cmd_test(update: Update, ctx):
     if not ctx.args:
-        await update.message.reply_text("Usage: /test https://www.wg-gesucht.de/wg-zimmer-in-....html")
+        await update.message.reply_text(f"Usage: /test <ad url> ({', '.join(s.label for s in SITES.values())})")
         return
-    l = listing_from_url(ctx.args[0])
+    try:
+        site = site_for_url(ctx.args[0])
+    except ValueError as e:
+        await update.message.reply_text(str(e))
+        return
+    l = site.listing_from_url(ctx.args[0])
     DB_.add(l, status="test")
     await update.message.reply_text("⏳ Reading ad, checking commute, drafting…")
     try:
         await process(ctx.bot, l, force=True)
     except Blocked as e:
-        await on_block(ctx.bot, e)
+        await on_block(ctx.bot, site, e)
     except Exception as e:
         await update.message.reply_text(f"Failed: {e}")
 
 
 # ---------------- main ----------------
 async def post_init(app: Application):
-    await WG_.start()
+    await BROWSER.start()
     await COMMUTE_.setup()
-    app.bot_data.update(paused=False, fails=0, n=0, counts={}, zeros={}, seeded={}, poll_lock=asyncio.Lock())
-    first = max(random.uniform(30, 90), GUARD.cooling_left() + 30 if GUARD.cooling_left() else 0)
+    app.bot_data.update(
+        paused=False, fails={}, n=0, counts={}, zeros={}, seeded={}, budget_warned={}, poll_lock=asyncio.Lock()
+    )
+    first = random.uniform(30, 90)
     app.job_queue.run_once(tick, first, name="poll")
     if CFG.get("replies", {}).get("enabled", True):
         app.job_queue.run_once(inbox_tick, first + random.uniform(60, 180), name="inbox")
     if hhmm := CFG["telegram"].get("daily_summary"):
         h, m = map(int, str(hhmm).split(":"))
         app.job_queue.run_daily(daily_summary, dtime(h, m, tzinfo=ZoneInfo("Europe/Berlin")), name="summary")
-    logged_in = True
-    try:  # 1 page load; sending and the Plus head start need the login
-        logged_in = await WG_.is_logged_in()
-        login = "logged in ✅" if logged_in else "⚠️ NOT logged in – run `python bot.py --login`"
-    except Exception as e:
-        login = f"login check failed ({e.__class__.__name__})"
+    # 1 page load per site; sending (and WG-Gesucht Plus's head start) need the login
+    lines, logged_in = await login_lines()
     await notify(
         app.bot,
-        f"🤖 WG agent started – first check in {int(first)}s. {GUARD.status()}. "
-        f"Commute check: {'on' if COMMUTE_.enabled else 'OFF'}. WG-Gesucht: {login}. /help",
+        f"🤖 Flat agent started – first check in {int(first)}s. "
+        f"Commute check: {'on' if COMMUTE_.enabled else 'OFF'}.\n" + "\n".join(lines) + "\n/help",
         important=not logged_in,  # quiet mode: only bother you if you need to log in again
     )
 
 
 async def post_shutdown(app: Application):
-    await WG_.stop()
+    await BROWSER.stop()
+
+
+def setup_sites(headless, block_resources):
+    """One shared browser; every supported site with its own page budget (sites.<name> can override poll:)."""
+    global BROWSER
+    BROWSER = Browser(headless=headless, block_resources=block_resources, domains=[t.domain for t in SITE_TYPES])
+    for t in SITE_TYPES:
+        own = (CFG.get("sites") or {}).get(t.name) or {}
+        key = "guard" if t.name == "wg-gesucht" else f"guard:{t.name}"  # WG-Gesucht keeps its old counts
+        SITES[t.name] = t(BROWSER, RateGuard(DB_.c, {**CFG["poll"], **own}, key=key), own)
 
 
 def main():
-    global CFG, DB_, WG_, LLM_, GUARD, COMMUTE_, APP, EXCEL
+    global CFG, DB_, LLM_, COMMUTE_, APP, EXCEL
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config.yaml")
-    ap.add_argument("--login", action="store_true", help="open a visible browser to log in to WG-Gesucht")
+    ap.add_argument(
+        "--login",
+        nargs="?",
+        const="all",
+        metavar="SITE",
+        help="open a visible browser to log in to every searched site, or only to SITE (e.g. kleinanzeigen)",
+    )
     a = ap.parse_args()
     CFG = yaml.safe_load(Path(a.config).read_text(encoding="utf-8"))
     CFG["telegram"]["chat_id"] = int(CFG["telegram"]["chat_id"])
 
     DB_ = DB()
-    GUARD = RateGuard(DB_.c, CFG["poll"])
     if a.login:
-        asyncio.run(interactive_login(guard=GUARD))  # its page loads count against the budget too
+        setup_sites(headless=False, block_resources=False)
+        sites = active_sites() if a.login == "all" else [SITES[a.login]] if a.login in SITES else []
+        if not sites:
+            raise SystemExit(f"Unknown site {a.login!r}. Choose from: {', '.join(SITES)}")
+        asyncio.run(interactive_login(BROWSER, sites))  # its page loads count against the budgets too
         return
 
-    WG_ = WG(
-        headless=CFG["poll"].get("headless", True),
-        guard=GUARD,
-        block_resources=CFG["poll"].get("block_resources", True),
-    )
+    setup_sites(CFG["poll"].get("headless", True), CFG["poll"].get("block_resources", True))
+    for sc in CFG["search"]["searches"]:
+        site_for_url(sc["url"])  # fail now on a search URL of an unsupported site
     city = CFG.get("city", "München")
     LLM_ = LLM(CFG["llm"], CFG["me"], city)
     COMMUTE_ = Commute(CFG.get("commute"), DB_.kv_get, DB_.kv_set, city)
@@ -956,9 +1071,8 @@ def main():
 
 
 DB_: DB
-WG_: WG
+BROWSER: Browser
 LLM_: LLM
-GUARD: RateGuard
 COMMUTE_: Commute
 APP: Application
 EXCEL = "applications.xlsx"

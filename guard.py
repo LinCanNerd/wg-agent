@@ -1,6 +1,6 @@
 """Request budget + block cooldown, persisted in SQLite so restarts never reset it.
 
-Every page load on wg-gesucht.de goes through RateGuard:
+Every site has its own RateGuard, and every page load on that site goes through it:
   - hourly and daily caps on page loads (background polling only)
   - escalating cooldowns after a block / captcha / 429 (15 min -> 1 h -> 3 h -> 12 h)
   - strikes decay after 24 h without problems
@@ -21,14 +21,15 @@ class CoolingDown(Exception):
 
 
 class RateGuard:
-    def __init__(self, conn, cfg: dict):
+    def __init__(self, conn, cfg: dict, key="guard"):
         self.c = conn
+        self.key = key  # kv row; WG-Gesucht keeps the original "guard" so its counts survive the update
         self.per_hour = int(cfg.get("max_pages_per_hour", 40))
         self.per_day = int(cfg.get("max_pages_per_day", 600))
         self.cooldowns = [m * 60 for m in cfg.get("block_cooldown_minutes", [15, 60, 180, 720])]
         self.c.execute("CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT)")
         self.c.commit()
-        s = self._get("guard", {})
+        s = self._get(key, {})
         self.hits: list[float] = s.get("hits", [])
         self.blocked_until: float = s.get("blocked_until", 0)
         self.strikes: int = s.get("strikes", 0)
@@ -48,7 +49,7 @@ class RateGuard:
                 "last_strike": self.last_strike,
             }
         )
-        self.c.execute("INSERT OR REPLACE INTO kv(k, v) VALUES('guard', ?)", (v,))
+        self.c.execute("INSERT OR REPLACE INTO kv(k, v) VALUES(?, ?)", (self.key, v))
         self.c.commit()
 
     # ---- accounting ----
