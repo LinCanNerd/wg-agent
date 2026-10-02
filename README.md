@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.jpeg" alt="wg-agent logo" width="220">
+</p>
+
 # wg-agent
 
 A WG-Gesucht flat-hunting assistant that runs on your own machine. It watches your
