@@ -124,10 +124,22 @@ def has_number(text: str, phone: str) -> bool:
 # Sentences a template-mode part must never contain: a claim about where I live (the model mixes that up
 # with the flat's location) or a refusal to answer. Dropping them is safe: the fixed text carries the message.
 BAD_SENTENCE = re.compile(
-    r"\bich wohne\b|\bda ich (in|im|am) [^.!?]{0,40}\bwohne\b|\bi (currently )?live (in|near|at)\b|"
+    r"\bich wohne (in|im|am|an|bei|nahe|gerade|derzeit|zurzeit|aktuell|schon)\b|\bwohne ich (in|im|am|an)\b|"
+    r"\bda ich (in|im|am) [^.!?]{0,40}\bwohne\b|\bi (currently )?live (in|near|at)\b|"
     r"keine angaben|kann ich (leider )?nicht(s)? sagen|can'?t (say|tell|share)|no information",
     re.I,
 )
+
+
+# Praise and opinion words that make a message sound generated; the part gets one rewrite without them.
+PRAISE_RE = re.compile(
+    r"\b(super|klasse|toll|cool|perfekt\w*|wunderbar\w*|spannend\w*|gemütlich\w*|charmant\w*|großartig\w*|"
+    r"traumhaft\w*|genial\w*|awesome|great|perfect\w*|lovely|amazing|wonderful|cozy|cosy|fantastic)\b",
+    re.I,
+)
+
+
+PRAISE_WORDS = ["super", "klasse", "toll", "cool", "perfekt", "wunderbar", "great", "awesome", "perfect"]
 
 
 def drop_bad_sentences(text: str) -> str:
@@ -200,17 +212,28 @@ price/size, WG vibe or studio quality, availability date, and who they are looki
 
 The part you write ("message"):
 - Write ONLY in {language}, even if the ad or my profile uses another language. {register}
-- One short, plain sentence (at most 25 words) saying why this place works for me, linking one concrete
-  fact from the ad to one fact from MY PROFILE (e.g. close to my work, they cook together and I like
-  cooking, an international WG). Write it the way a normal person types a quick message.
+- One or two short, plain sentences (at most 30 words in total) with facts, the way a normal person
+  types a quick message:
+  - the way to my work, with the real minutes from the first COMMUTE line (bike or public transport,
+    whichever is shorter): "Von hier wäre ich mit der U-Bahn in 25 Minuten bei der Arbeit." / "From here
+    I'd be at work in 25 minutes by U-Bahn." Skip it if COMMUTE is unknown. Never mention the other
+    COMMUTE places.
+  - a second sentence ONLY if the ad itself mentions something that matches MY PROFILE, said as a plain
+    fact in your own words. For example, only if the ad says the WG is international: "Ich wohne gern mit
+    Leuten aus verschiedenen Ländern zusammen."; only if they cook together: "Ich koche auch gern für
+    andere mit."; only if they do sports: "Beim Volleyball wäre ich sofort dabei." If nothing in the ad
+    matches, write only the commute sentence.
 - MY FIXED TEXT is shown below: never repeat anything it already says (my age, job, origin, hobbies,
   cooking, smoking, pets, languages, viewing, contact). Add only what is new.
 - Use ONLY facts from MY PROFILE. Never invent anything (study subject, where I live now, dates). The
   flat's location is not where I live: wrong "Da ich in der Altstadt wohne, ...", right "Von hier wäre
   ich schnell bei der Arbeit in ...". If the ad asks something my profile doesn't answer, leave it out
   (don't write that you can't answer) and say so in "notes".
-- Never praise the flat or the ad, never repeat their description back to them, no adjectives like
-  wonderful, perfect, charming, cosy, exciting (wunderbar, perfekt, spannend, gemütlich, charmant, toll).
+- No praise and no opinions about the flat, the WG or the ad: no "super", "klasse", "toll", "cool",
+  "perfekt", "wunderbar", "spannend", "gemütlich", "finde ich schön" (awesome, great, perfect, lovely,
+  cozy, amazing). Never repeat their description back to them.
+- Never give my job or hobbies as the reason for something ("Da ich in der Robotik arbeite, passt die
+  Lage" makes no sense).
 - If the ad asks applicants questions or to mention something (favourite dish, hobbies, why you...),
   add one short, casual sentence per question with the answer from MY PROFILE, unless my fixed text
   already answers it.
@@ -426,6 +449,16 @@ class LLM:
                     want_json=False,
                 )
             msg = drop_bad_sentences(msg)
+            if PRAISE_RE.search(msg):  # one rewrite without the gushing; then drop what still gushes
+                msg = await self._chat(
+                    f"Rewrite this {language} text without praise or opinion words ({', '.join(PRAISE_WORDS)}). "
+                    "Keep every fact, answer and any code word; plain and short. Output only the text.",
+                    msg,
+                    want_json=False,
+                )
+                msg = " ".join(
+                    x for x in re.split(r"(?<=[.!?])\s+", msg.strip()) if not PRAISE_RE.search(x) or (kw and kw in x)
+                )
             if kw and plain_start:  # the template puts it first itself: drop it from the part
                 msg = strip_code_sentences(msg, kw)
             elif kw:
