@@ -1,0 +1,22 @@
+# systemd user unit. Install:
+#   cp wg-agent.service ~/.config/systemd/user/ && systemctl --user enable --now wg-agent
+# %h is your home directory; change the paths if the repo isn't in ~/wg-agent.
+[Unit]
+Description=WG-Gesucht Telegram agent
+After=network-online.target
+Wants=network-online.target
+# If Ollama also runs as a user unit, start it first:
+# After=network-online.target ollama.service
+# Wants=ollama.service
+
+[Service]
+WorkingDirectory=%h/wg-agent
+ExecStart=%h/wg-agent/.venv/bin/python bot.py
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=30
+# stop only the bot: it saves the WG-Gesucht session, then closes its own Chromium
+KillMode=mixed
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,185 @@
+# wg-agent configuration.
+# Copy to config.yaml (which is gitignored) and fill in everything marked TODO:
+#   cp config.example.yaml config.yaml
+
+city: "München"   # used in the LLM prompt and for geocoding addresses
+
+telegram:
+  bot_token: "123456:ABC-your-token-from-BotFather"   # TODO: create a bot with @BotFather
+  chat_id: 123456789          # TODO: your own Telegram user id (ask @userinfobot)
+  photos: true                # send the ad's photos as an album above each card
+  max_photos: 10              # Telegram allows at most 10 per album
+
+llm:
+  # Any OpenAI-compatible API works: a model on your own machine, or a cloud provider (no GPU needed).
+  #
+  #   Local (free and private, needs a strong GPU or Apple Silicon):
+  #     Ollama      base_url: "http://localhost:11434/v1"
+  #     LM Studio   base_url: "http://localhost:1234/v1"
+  #     vLLM        base_url: "http://localhost:8000/v1"
+  #   Cloud (pay per use; your profile and the ads you get are sent to the provider):
+  #     OpenAI      base_url: "https://api.openai.com/v1"
+  #     Anthropic   base_url: "https://api.anthropic.com/v1/"
+  #     Google      base_url: "https://generativelanguage.googleapis.com/v1beta/openai/"
+  #     Mistral     base_url: "https://api.mistral.ai/v1"
+  #     Groq        base_url: "https://api.groq.com/openai/v1"
+  #     OpenRouter  base_url: "https://openrouter.ai/api/v1"     (one key for many vendors' models)
+  #   For `model`, use a name from your server's or provider's model list.
+  base_url: "http://localhost:11434/v1"
+  model: "gemma4:31b"
+  api_key: ""                 # cloud only; or leave empty and set the LLM_API_KEY environment variable
+  temperature: 0.6            # null = the model's default (some reasoning models accept nothing else)
+  # Turning "thinking" off makes local models much faster. How depends on the model:
+  #   Gemma 4 via Ollama:  no_think_suffix: false, extra_body: {reasoning_effort: "none"}
+  #   Qwen3:               no_think_suffix: true,  extra_body: {}
+  #   Qwen3 via vLLM:      no_think_suffix: false, extra_body: {chat_template_kwargs: {enable_thinking: false}}
+  #   Cloud providers:     no_think_suffix: false, extra_body: {}
+  no_think_suffix: false      # appends /no_think to the prompt (Qwen3 soft switch)
+  extra_body: {reasoning_effort: "none"}
+
+  # Example: a cloud model instead (replace the six lines above)
+  # base_url: "https://api.anthropic.com/v1/"
+  # model: "claude-haiku-4-5-20251001"
+  # api_key: "sk-ant-..."
+  # temperature: 0.6
+  # no_think_suffix: false
+  # extra_body: {}
+
+poll:
+  # --- pacing (each check = 1 page load per due search) ---
+  interval_seconds: 120         # daytime base interval
+  jitter_seconds: 90            # + random 0..90 s, so checks land every 2-3.5 min, never regular
+  night_hours: [1, 7]           # between 01:00 and 07:00 ...
+  night_interval_seconds: 1200  # ... only every ~20 min (few ads are posted at night)
+  max_details_per_poll: 3       # open at most 3 new ads per check; the rest wait for the next one
+
+  # --- hard safety budget (counts every page load, survives restarts) ---
+  max_pages_per_hour: 40
+  max_pages_per_day: 650
+  block_cooldown_minutes: [15, 60, 180, 720]   # escalating pause after each captcha/429/403
+  block_resources: true         # don't download images/fonts/videos
+
+  headless: true
+  skip_existing_on_start: true  # don't open every ad that's already online on the first run
+
+search:
+  # One entry per search. The agent adds newest-first sorting, "no Tauschangebote", max rent and
+  # min size to the URL automatically, so WG-Gesucht does most of the filtering. You can also paste
+  # a search URL from the site with your own filters. For another city, open its WG-Gesucht search
+  # page and copy the URL (the number after the city name is the city id; Munich = 90).
+  searches:
+    - kind: room                    # WG room
+      url: "https://www.wg-gesucht.de/wg-zimmer-in-Muenchen.90.0.1.0.html"
+      max_rent: 800
+      min_score: 6
+      every_n_polls: 1              # checked on every poll
+      max_ad_age_hours: 48          # ignore ads that were already online for longer
+    - kind: studio                  # 1-Zimmer-Wohnung
+      url: "https://www.wg-gesucht.de/1-zimmer-wohnungen-in-Muenchen.90.1.1.0.html"
+      max_rent: 1100
+      min_score: 8                  # only show really good ones
+      every_n_polls: 3              # every 3rd poll (~every 8 min)
+      max_ad_age_hours: 72
+
+  # Extra hard filters applied by the agent (leave empty / 0 to disable)
+  min_size: 12
+  available_from_before: ""             # YYYY-MM-DD: the place must be free by then
+  min_duration_months: 6                # rejects sublets shorter than this (0 = allow all)
+  districts_include: []                 # e.g. ["Schwabing", "Maxvorstadt", "Au-Haidhausen"]
+  districts_exclude: ["Garching", "Unterföhring", "Ismaning", "Pullach", "Unterhaching",
+                      "Ottobrunn", "Neubiberg", "Planegg", "Gräfelfing", "Neuried",
+                      "Unterschleißheim", "Oberschleißheim", "Haar", "Taufkirchen",
+                      "Germering", "Puchheim", "Feldkirchen", "Aschheim"]   # towns outside Munich
+  keywords_exclude: []                  # e.g. ["Zwischenmiete", "nur Frauen", "female only"]
+
+commute:
+  enabled: true
+  provider: transitous        # transitous = free, no key | google = needs google_api_key
+  google_api_key: ""
+  depart: "08:00"             # typical departure on a weekday
+  # viewbox: "11.36,48.25,11.73,48.06"   # lon,lat,lon,lat box for geocoding; defaults to Munich
+  destinations:               # the first one is used for the 🚲 Route button
+    - name: Work
+      query: "Marienplatz, München"   # TODO: geocoded once at startup; or set lat/lng yourself
+      # lat: 48.13743
+      # lng: 11.57549
+      max_bike_minutes: 30      # feasible if bike <= 30 min ...
+      max_transit_minutes: 40   # ... or public transport <= 40 min
+      action: exclude           # exclude = never show me | mark = show with a warning
+    - name: University
+      query: "Universität, München"
+      max_transit_minutes: 40
+      action: mark
+
+replies:
+  enabled: true
+  check_minutes: 12           # read your WG-Gesucht inbox every ~12 min (1 page load)
+  night_check_minutes: 60
+  excel_path: "applications.xlsx"   # every sent message + status (sent / replied); /excel in Telegram
+
+language: auto      # auto | de | en  (auto = language of the ad)
+
+send:
+  dry_run: true     # true = fill the form + screenshot but DON'T press send. Set false when happy.
+
+# Everything below is about you. The model only uses facts written here, so be complete and honest:
+# if an ad asks something your profile doesn't answer (smoker? pets?), the model may guess.
+me:
+  name: "Alex"                   # TODO: your first name (used to sign messages)
+  gender: m                      # m / w: skips WG ads that only want the other gender
+  mode: full                     # full = the model writes the whole message
+                                 # template = the model writes only 2-4 tailored sentences that go into
+                                 #            your fixed text below
+  templates:                     # only used in template mode
+    room_de: |
+      {greeting}
+
+      ich bin {name}, 27, und arbeite als Softwareentwickler in München.
+
+      {personal}
+
+      Ich bin offen, ordentlich und zuverlässig. Ich würde mich sehr über eine Besichtigung
+      oder einen Videocall freuen!
+
+      Viele Grüße
+      {name}
+    room_en: |
+      {greeting}
+
+      I'm {name}, 27, and I work as a software developer in Munich.
+
+      {personal}
+
+      I'm open, tidy and reliable. I'd love to come by for a viewing or have a video call!
+
+      Best,
+      {name}
+  # TODO: replace this example person with yourself.
+  profile: |
+    27 years old.
+    Software developer at a company in Munich, permanent contract. Stable income, can provide
+    proof of income and a Schufa.
+    Languages: German (fluent), English (fluent).
+    Non-smoker, no pets. Move-in date: flexible.
+    Open, tidy and reliable; happy to share cooking and the occasional WG evening.
+    Hobbies: climbing, cycling, board games.
+    Favourites (used when an ad asks): dish: Kaiserschmarrn; movie: Amélie.
+  preferences: |
+    Must be inside the city of Munich (no surrounding towns).
+    Location matters most: a short commute to work near Marienplatz (city centre).
+    BEST (score high): central districts on U-Bahn/S-Bahn lines with a direct ride to Marienplatz
+    (Maxvorstadt, Schwabing, Au-Haidhausen, Isarvorstadt, Ludwigsvorstadt, Sendling).
+    GOOD: anywhere within ~30 min by bike or public transport.
+    WORSE: outer districts with long commutes.
+    WG room: social WG where people sometimes do things together; clean flat. Long-term preferred.
+    Studio (1-Zimmer-Wohnung): only if it is really nice (good condition, good location, decent
+    size, kitchen) - be strict, average studios should score 6 or lower.
+  message_guidelines: |
+    120-180 words, warm and personal, not generic.
+    Refer to 1-2 concrete things from the ad (flatmates, hobbies, WG life).
+    For a studio, write to a landlord/tenant: more formal ("Sie" in German), focus on reliability,
+    stable job, can provide documents (Schufa, income proof).
+    Mention briefly who I am and what I do; mention hobbies only if they fit the WG's vibe.
+    Do NOT state exact salary numbers; "stable income" is enough unless the ad asks.
+    In German use "du"/"ihr" (WG style). End with availability for a viewing or video call.
+    Sign with my first name. No emojis, no placeholders.

@@ -1,0 +1,22 @@
+# Personal data and secrets: never commit these
+config.yaml
+CLAUDE.local.md
+.claude/settings.local.json
+.env
+
+# Logged-in browser (session cookies)
+browser-profile/
+browser-session.json
+
+# Runtime state
+wg.sqlite
+wg.sqlite-*
+applications.xlsx
+screenshots/
+*.log
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.ruff_cache/

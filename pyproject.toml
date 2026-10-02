@@ -1,0 +1,18 @@
+[project]
+name = "wg-agent"
+version = "0.1.0"
+description = "WG-Gesucht flat-hunting agent: LLM drafts, Telegram approval, nothing sent without you"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = [
+    "E501",  # the formatter handles line length; long regexes and JS selectors stay on one line
+    "E741",  # `l` is used for listings throughout
+]

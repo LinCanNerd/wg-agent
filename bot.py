@@ -1,0 +1,872 @@
+"""WG-Gesucht watcher + Telegram approval bot.
+
+Usage:
+    python bot.py --login     # once: log in to WG-Gesucht in a visible browser
+    python bot.py             # run the agent
+"""
+
+import argparse
+import asyncio
+import html
+import json
+import logging
+import random
+import re
+import sqlite3
+import time
+from datetime import datetime
+from pathlib import Path
+
+import yaml
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
+from telegram.constants import ParseMode
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
+
+from commute import Commute
+from guard import BudgetExceeded, CoolingDown, RateGuard
+from llm import LLM, detect_language, first_name
+from tracker import looks_like_mine, match_conversation, write_excel
+from wg import (
+    WG,
+    Blocked,
+    Listing,
+    LoggedOut,
+    conversation_ad_id,
+    inbox,
+    interactive_login,
+    listing_from_url,
+    prepare_search_url,
+)
+
+logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+log = logging.getLogger("agent")
+
+CFG: dict = {}
+
+
+# ---------------- storage ----------------
+class DB:
+    def __init__(self, path="wg.sqlite"):
+        self.c = sqlite3.connect(path, check_same_thread=False)
+        self.c.row_factory = sqlite3.Row
+        self.c.execute(
+            """CREATE TABLE IF NOT EXISTS listings(
+                 id TEXT PRIMARY KEY, url TEXT, title TEXT, data TEXT, status TEXT,
+                 note TEXT, lang TEXT, score INTEGER, draft TEXT, created REAL)"""
+        )
+        self.c.execute("CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT)")
+        for col in ("fp TEXT", "sent_at REAL", "reply_at REAL", "reply_text TEXT", "conv_url TEXT", "poster_id TEXT"):
+            try:
+                self.c.execute(f"ALTER TABLE listings ADD COLUMN {col}")
+            except sqlite3.OperationalError:
+                pass
+        self.c.commit()
+
+    def count_kind(self, kind):
+        return self.c.execute("SELECT COUNT(*) FROM listings WHERE data LIKE ?", (f'%"kind": "{kind}"%',)).fetchone()[0]
+
+    def seen(self, lid):
+        return self.c.execute("SELECT 1 FROM listings WHERE id=?", (lid,)).fetchone() is not None
+
+    def add(self, l: Listing, status="new"):
+        self.c.execute(
+            "INSERT OR IGNORE INTO listings(id,url,title,data,status,created) VALUES(?,?,?,?,?,?)",
+            (l.id, l.url, l.title, json.dumps(l.to_dict()), status, time.time()),
+        )
+        self.c.commit()
+
+    def update(self, lid, **f):
+        if "data" in f and isinstance(f["data"], Listing):
+            f["data"] = json.dumps(f["data"].to_dict())
+        cols = ", ".join(f"{k}=?" for k in f)
+        self.c.execute(f"UPDATE listings SET {cols} WHERE id=?", (*f.values(), lid))
+        self.c.commit()
+
+    def get(self, lid):
+        return self.c.execute("SELECT * FROM listings WHERE id=?", (lid,)).fetchone()
+
+    def queued(self, n):
+        rows = self.c.execute("SELECT * FROM listings WHERE status='queued'").fetchall()
+        # freshest ad first (by WG-Gesucht's "Online: x min"), not by id – ids aren't chronological
+        rows.sort(key=lambda r: (json.loads(r["data"]).get("online_min") or 10**6, -r["created"]))
+        return rows[:n]
+
+    def expire_queue(self, hours):
+        self.c.execute(
+            "UPDATE listings SET status='stale' WHERE status='queued' AND created < ?", (time.time() - hours * 3600,)
+        )
+        self.c.commit()
+
+    def repost_of(self, fp, lid):
+        """Same flat re-uploaded under a new id (Fredy/jonasdieker idea)."""
+        r = self.c.execute(
+            "SELECT id, status FROM listings WHERE fp=? AND id<>? AND created > ? "
+            "AND status IN ('pending','sent','skipped','low_score','filtered','already') LIMIT 1",
+            (fp, lid, time.time() - 30 * 86400),
+        ).fetchone()
+        return r
+
+    def same_person(self, l: Listing):
+        """Have I already written to this advertiser (any of their ads)?"""
+        if l.poster_id:
+            r = self.c.execute(
+                "SELECT id, title FROM listings WHERE poster_id=? AND id<>? AND status IN ('sent','replied','already')",
+                (l.poster_id, l.id),
+            ).fetchone()
+            if r:
+                return r
+        if l.poster and len(l.poster) > 3:  # fallback without id: same name + same street
+            street = (l.address or l.street or "").split()[0:1]
+            for r in self.c.execute(
+                "SELECT id, title, data FROM listings WHERE id<>? AND status IN ('sent','replied','already')", (l.id,)
+            ):
+                d = json.loads(r["data"])
+                if (
+                    d.get("poster") == l.poster
+                    and street
+                    and (d.get("address") or d.get("street") or "").split()[0:1] == street
+                ):
+                    return r
+        return None
+
+    def sent_rows(self):
+        return self.c.execute("SELECT * FROM listings WHERE status IN ('sent','replied','already')").fetchall()
+
+    def kv_get(self, k, default=None):
+        r = self.c.execute("SELECT v FROM kv WHERE k=?", (k,)).fetchone()
+        return json.loads(r[0]) if r else default
+
+    def kv_set(self, k, v):
+        self.c.execute("INSERT OR REPLACE INTO kv(k, v) VALUES(?, ?)", (k, json.dumps(v)))
+        self.c.commit()
+
+    def stats(self):
+        return dict(self.c.execute("SELECT status, COUNT(*) FROM listings GROUP BY status").fetchall())
+
+
+def fingerprint(l: Listing) -> str:
+    street = re.sub(r"[^a-zäöüß]", "", (l.address or l.street or "").lower().split("\n")[0])[:25]
+    return f"{l.kind}|{street}|{l.size}|{round((l.rent or 0) / 25)}"
+
+
+# ---------------- filtering ----------------
+def _d(s):
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(str(s), fmt).date()
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def search_cfg(kind):
+    for s in CFG["search"]["searches"]:
+        if s.get("kind", "room") == kind:
+            return s
+    return {}
+
+
+def hard_filter(l: Listing, extra_text="") -> str | None:
+    s = {**CFG["search"], **search_cfg(l.kind)}
+    if s.get("max_rent") and l.rent and l.rent > s["max_rent"]:
+        return f"rent {l.rent} €"
+    if s.get("min_size") and l.size and l.size < s["min_size"]:
+        return f"size {l.size} m²"
+    if s.get("max_ad_age_hours") and l.online_min and l.online_min > s["max_ad_age_hours"] * 60:
+        return f"old ad ({l.online})"
+    if l.exchange:
+        return "Tauschangebot"
+    hay = f"{l.title} {l.card_text} {extra_text}".lower()
+    for kw in s.get("keywords_exclude") or []:
+        if kw.lower() in hay:
+            return f"keyword '{kw}'"
+    loc = f"{l.district} {l.address} {l.card_text}".lower()
+    inc = s.get("districts_include") or []
+    if inc and not any(d.lower() in loc for d in inc):
+        return f"district '{l.district}'"
+    for d in s.get("districts_exclude") or []:
+        if d.lower() in loc:
+            return f"district '{d}'"
+    g = (CFG["me"].get("gender") or "").lower()
+    w = (l.wanted or "").lower()
+    if l.kind == "room" and g in ("m", "w"):
+        only_f = re.search(
+            r"(^|[;,]\s*)mitbewohnerin gesucht|^frau(en)? |nur (für )?frauen|female only|only (girls|women|female)",
+            w + " " + hay,
+        )
+        only_m = re.search(
+            r"(^|[;,]\s*)mitbewohner gesucht|^mann |^männer |nur (für )?männer|male only|only (guys|men|male)",
+            w + " " + hay,
+        )
+        if g == "m" and only_f and "oder" not in w:
+            return "looking for women only"
+        if g == "w" and only_m and "oder" not in w:
+            return "looking for men only"
+    af, lim = _d(l.available_from), _d(s.get("available_from_before"))
+    if af and lim and af > lim:
+        return f"free from {l.available_from}"
+    mdm = s.get("min_duration_months") or 0
+    to = _d(l.available_to)
+    if mdm and af and to and (to - af).days < mdm * 30:
+        return f"only {l.available_from}–{l.available_to}"
+    return None
+
+
+# ---------------- telegram UI ----------------
+def keyboard(lid, l: Listing | None = None):
+    rows = [
+        [
+            InlineKeyboardButton("✅ Send", callback_data=f"send:{lid}"),
+            InlineKeyboardButton("❌ Skip", callback_data=f"skip:{lid}"),
+        ],
+        [
+            InlineKeyboardButton("✏️ Edit", callback_data=f"edit:{lid}"),
+            InlineKeyboardButton("🔁 Rewrite", callback_data=f"rewrite:{lid}"),
+        ],
+    ]
+    if l:
+        links = [InlineKeyboardButton("🔗 Ad", url=l.url)]
+        if l.lat:
+            links.append(
+                InlineKeyboardButton("🗺 Map", url=f"https://www.google.com/maps/search/?api=1&query={l.lat},{l.lng}")
+            )
+            dest = (CFG.get("commute") or {}).get("destinations") or []
+            if dest:
+                links.append(
+                    InlineKeyboardButton(
+                        "🚲 Route",
+                        url=f"https://www.google.com/maps/dir/?api=1&origin={l.lat},{l.lng}"
+                        f"&destination={html.escape(dest[0].get('query', ''))}&travelmode=bicycling",
+                    )
+                )
+        rows.append(links)
+    return InlineKeyboardMarkup(rows)
+
+
+def card_text(l: Listing, r, meta, with_translation=True):
+    e = html.escape
+    kind = "🏢 STUDIO" if l.kind == "studio" else "🏠 WG"
+    lines = [
+        f"{kind} <b>{e(l.title or 'Angebot')}</b>",
+        f"💶 {l.rent or '?'} € · 📐 {l.size or '?'} m² · 📍 {e(l.address or (l.street + ', ' + l.district))}",
+        f"📅 {l.available_from or '?'} → {l.available_to or 'unbefristet'} · 🗣 {(r['lang'] or 'de').upper()}"
+        + (f" · ⏱ {e(l.online.replace('Online: ', ''))}" if l.online else ""),
+    ]
+    who = " · ".join(
+        filter(
+            None,
+            [
+                l.flatmates,
+                l.wanted,
+                f"by {first_name(l.poster) or l.poster}" if l.poster else "",
+                f"member since {l.member_since}" if l.member_since else "",
+            ],
+        )
+    )
+    if who:
+        lines.append(f"👥 {e(who)}")
+    if l.commute_text:
+        lines.append(f"🧭 {e(l.commute_text)}")
+    if l.applicants is not None:
+        lines.append(f"📨 {l.applicants} applicants so far")
+    if r["score"] is not None:
+        lines.append(f"⭐ {r['score']}/10 — {e(meta.get('reasons') or '')}")
+    for w in meta.get("warnings") or []:
+        lines.append(f"⚠️ {e(w)}")
+    if meta.get("red_flags"):
+        lines.append(f"🚩 {e(meta['red_flags'])}")
+    if kw := meta.get("keyword"):  # re-checked on every card, so a manual edit can't silently drop it
+        draft = (r["draft"] or "").strip()
+        at_start = meta.get("keyword_at_start")
+        sentence = next((s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", draft) if kw.lower() in s.lower()), "")
+        if not sentence:
+            status = "⛔ MISSING from the draft"
+        elif at_start and not draft.lower().startswith(kw.lower()):
+            status = "⚠️ not the first word"
+        elif sentence.lower().strip(" .,!?") == kw.lower():
+            status = "⚠️ stands alone, not in a sentence"
+        else:
+            status = "✅"
+        lines.append(f"🔑 Code word <b>{e(kw)}</b> ({'must be the first word' if at_start else 'anywhere'}) {status}")
+        if sentence:
+            lines.append(f"      ↳ <i>{e(sentence[:300])}</i>")
+    if meta.get("questions"):
+        lines.append(f"❓ Answered: {e(meta['questions'])}")
+    if meta.get("notes"):
+        lines.append("\n<b>Notes:</b>\n" + "\n".join(f"📝 {e(n)}" for n in meta["notes"]))
+    lines.append(f"\n<b>Draft:</b>\n<pre>{e((r['draft'] or '')[:3000])}</pre>")
+    if with_translation and meta.get("translation"):
+        lines.append(
+            f"<b>🇬🇧 In English (just for you, not sent):</b>\n"
+            f"<blockquote expandable>{e(meta['translation'][:3000])}</blockquote>"
+        )
+    return "\n".join(lines)
+
+
+def tg_len(text_html):
+    """Length Telegram counts against its 4096 limit: text after the HTML tags are parsed."""
+    return len(html.unescape(re.sub(r"<[^>]+>", "", text_html)))
+
+
+async def post_card(bot, lid, with_photo=True):
+    r = DB_.get(lid)
+    l = Listing.from_dict(json.loads(r["data"]))
+    meta = json.loads(r["note"]) if (r["note"] or "").startswith("{") else {}
+    tg = CFG.get("telegram", {})
+    chat = tg["chat_id"]
+    reply_to = None
+    photos = (l.images or ([l.image] if l.image else []))[: min(tg.get("max_photos", 10), 10)]  # album max 10
+    if with_photo and photos and tg.get("photos", True):
+        # Telegram fetches the images itself – costs nothing from our WG-Gesucht budget.
+        # One bad URL fails the whole album, so fall back to the main photo alone.
+        for attempt in ([photos] if len(photos) > 1 else []) + [photos[:1]]:
+            try:
+                if len(attempt) > 1:
+                    msgs = await bot.send_media_group(
+                        chat, [InputMediaPhoto(u) for u in attempt], disable_notification=True
+                    )
+                    reply_to = msgs[0].message_id
+                else:
+                    reply_to = (await bot.send_photo(chat, attempt[0], disable_notification=True)).message_id
+                break
+            except Exception as ex:
+                log.warning("sending %d photo(s) failed: %s", len(attempt), ex)
+    text = card_text(l, r, meta)
+    # long draft + translation: the translation goes in its own message
+    separate = bool(meta.get("translation")) and tg_len(text) > 4000
+    if separate:
+        text = card_text(l, r, meta, with_translation=False)
+    card = await bot.send_message(
+        chat,
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard(lid, l),
+        disable_web_page_preview=True,
+        reply_to_message_id=reply_to,
+    )
+    if separate:
+        await bot.send_message(
+            chat,
+            f"<b>🇬🇧 In English (just for you, not sent):</b>\n"
+            f"<blockquote expandable>{html.escape(meta['translation'][:3500])}</blockquote>",
+            parse_mode=ParseMode.HTML,
+            reply_to_message_id=card.message_id,
+            disable_notification=True,
+        )
+
+
+async def english_version(text, keyword=""):
+    """Translation of a German draft for the card; empty for English drafts or if the model fails."""
+    if not text or detect_language(text) != "de":
+        return ""
+    try:
+        return await LLM_.translate(text, keyword or "")
+    except Exception:
+        log.exception("translation failed")
+        return ""
+
+
+async def notify(bot, text):
+    await bot.send_message(CFG["telegram"]["chat_id"], text, disable_web_page_preview=True)
+
+
+# ---------------- core pipeline ----------------
+async def process(bot, l: Listing, force=False):
+    """Details -> filters -> commute -> LLM -> Telegram card. force=True skips filters (for /test)."""
+    try:
+        await WG_.fetch_details(l)
+    except LookupError as e:
+        DB_.update(l.id, status="gone", note=str(e))
+        if force:
+            await notify(bot, f"Couldn't read the ad: {e}")
+        return
+    fp = fingerprint(l)
+    DB_.update(l.id, data=l, title=l.title, fp=fp, poster_id=l.poster_id or None)
+    if not force:
+        if why := hard_filter(l, l.description):
+            DB_.update(l.id, status="filtered", note=why)
+            log.info("filtered %s: %s", l.id, why)
+            return
+        if prev := DB_.same_person(l):
+            DB_.update(l.id, status="same_person", note=f"already wrote to this person (ad {prev['id']})")
+            log.info("same person %s (ad %s)", l.id, prev["id"])
+            return
+        if prev := DB_.repost_of(fp, l.id):
+            DB_.update(l.id, status="repost", note=f"repost of {prev['id']} ({prev['status']})")
+            log.info("repost %s of %s", l.id, prev["id"])
+            return
+
+    res, l.commute_text = await COMMUTE_.for_listing(l)
+    l.commute = res
+    DB_.update(l.id, data=l)
+    why, warnings = COMMUTE_.check(res)
+    if l.poster and l.poster in (DB_.kv_get("inbox_names", []) or []):
+        warnings.append(f"you already have a chat with someone called {l.poster} – check it's not the same person")
+    if why and not force:
+        DB_.update(l.id, status="filtered", note=why)
+        log.info("filtered %s: %s", l.id, why)
+        return
+
+    lang = CFG.get("language", "auto")
+    if lang not in ("de", "en"):
+        lang = detect_language(l.title + "\n" + l.description)
+    try:
+        out = await LLM_.evaluate(l, lang, COMMUTE_.prompt_text(res))
+    except Exception as e:
+        log.exception("LLM failed")
+        DB_.update(l.id, status="error", note=str(e)[:500])
+        await notify(bot, f"⚠️ New ad but drafting failed ({e.__class__.__name__}): {l.url}")
+        return
+    if out.get("commute_ok") is False and res:
+        warnings.append("the model thinks the commute isn't feasible")
+    meta = {k: out.get(k) for k in ("reasons", "red_flags", "keyword", "keyword_at_start", "questions", "notes")}
+    meta["warnings"] = warnings
+    DB_.update(l.id, lang=lang, score=out["score"], draft=out["message"], note=json.dumps(meta))
+    min_score = search_cfg(l.kind).get("min_score", CFG["search"].get("min_score", 0))
+    if not force and out["score"] < min_score:
+        DB_.update(l.id, status="low_score")
+        log.info("low score %s: %s (%s)", l.id, out["score"], out["reasons"])
+        return
+    meta["translation"] = await english_version(out["message"], meta.get("keyword"))  # only for ads you'll see
+    DB_.update(l.id, status="pending", note=json.dumps(meta))
+    await post_card(bot, l.id)
+
+
+def next_delay():
+    p = CFG["poll"]
+    n0, n1 = p.get("night_hours", [1, 7])
+    night = n0 <= datetime.now().hour < n1
+    base = p.get("night_interval_seconds", 900) if night else p.get("interval_seconds", 120)
+    d = base + random.uniform(0, p.get("jitter_seconds", 0))
+    if GUARD.cooling_left():
+        d = max(d, GUARD.cooling_left() + random.uniform(30, 120))
+    return d
+
+
+async def tick(ctx: ContextTypes.DEFAULT_TYPE):
+    """Self-scheduling loop: irregular intervals, slower at night, waits out cooldowns."""
+    try:
+        await poll_once(ctx)
+    except Exception:
+        log.exception("poll crashed")
+    finally:
+        ctx.job_queue.run_once(tick, next_delay(), name="poll")
+
+
+async def on_block(bot, why):
+    wait = GUARD.strike()
+    await notify(
+        bot,
+        f"🛑 WG-Gesucht pushed back ({why}). Cooling down {wait // 60} min "
+        f"(strike {GUARD.strikes}). Nothing to do; I'll resume by myself.",
+    )
+
+
+async def poll_once(ctx: ContextTypes.DEFAULT_TYPE):
+    st = ctx.bot_data
+    if st["paused"] or GUARD.cooling_left() or st["poll_lock"].locked():
+        return
+    async with st["poll_lock"]:
+        try:
+            await _poll(ctx, st)
+        except Blocked as e:
+            await on_block(ctx.bot, e)
+        except CoolingDown:
+            pass
+        except BudgetExceeded:
+            hour = datetime.now().strftime("%Y-%m-%d %H")
+            log.warning("page budget reached: %s", GUARD.status())
+            if st.get("budget_warned") != hour:
+                st["budget_warned"] = hour
+                await notify(
+                    ctx.bot, f"⏳ Hit my own safety budget ({GUARD.status()}). Skipping checks until it frees up."
+                )
+
+
+async def _poll(ctx, st):
+    p = CFG["poll"]
+    st["n"] += 1
+    due = [s for s in CFG["search"]["searches"] if (st["n"] - 1) % max(1, int(s.get("every_n_polls", 1))) == 0]
+    for i, sc in enumerate(due):
+        if i:
+            await asyncio.sleep(random.uniform(8, 20))
+        kind = sc.get("kind", "room")
+        url = prepare_search_url(sc["url"], sc.get("max_rent"), CFG["search"].get("min_size"))
+        try:
+            listings = await WG_.search(url, kind)
+        except (Blocked, BudgetExceeded, CoolingDown):
+            raise
+        except Exception as e:
+            log.exception("search failed")
+            st["fails"] += 1
+            if st["fails"] == 3:
+                await notify(ctx.bot, f"⚠️ Search failing repeatedly: {e}")
+            return
+        st["fails"] = 0
+        # Soft-block detection: a search that normally has results suddenly returns none, twice.
+        prev = st["counts"].get(kind, 0)
+        if not listings and prev >= 5:
+            st["zeros"][kind] = st["zeros"].get(kind, 0) + 1
+            if st["zeros"][kind] >= 2:
+                st["zeros"][kind] = 0
+                raise Blocked("search suddenly returns nothing")
+            continue
+        st["zeros"][kind] = 0
+        st["counts"][kind] = len(listings)
+        st["last_poll"] = datetime.now().strftime("%H:%M:%S")
+
+        new = [l for l in listings if not DB_.seen(l.id)]
+        if not st["seeded"].get(kind) and p.get("skip_existing_on_start") and DB_.count_kind(kind) == 0:
+            for l in new:
+                DB_.add(l, status="preexisting")
+            log.info("marked %d existing %s listings as seen", len(new), kind)
+            new = []
+        st["seeded"][kind] = True
+        for l in new:
+            DB_.add(l, status="queued")
+            if why := hard_filter(l):  # cheap check on the card, no extra page load
+                DB_.update(l.id, status="filtered", note=why)
+
+    # Open at most N ads per poll (freshest first); the rest wait for the next poll.
+    DB_.expire_queue(hours=24)
+    for r in DB_.queued(int(p.get("max_details_per_poll", 3))):
+        l = Listing.from_dict(json.loads(r["data"]))
+        await asyncio.sleep(random.uniform(6, 15))
+        try:
+            await process(ctx.bot, l)
+        except (Blocked, BudgetExceeded, CoolingDown):
+            DB_.update(l.id, status="queued")  # retry later
+            raise
+        except Exception as e:
+            log.exception("process failed")
+            DB_.update(l.id, status="error", note=str(e)[:500])
+
+
+# ---------------- replies ----------------
+async def inbox_tick(ctx: ContextTypes.DEFAULT_TYPE):
+    try:
+        await check_replies(ctx.bot)
+    except LoggedOut:
+        await notify(ctx.bot, "⚠️ Can't read your inbox: logged out of WG-Gesucht. Run python bot.py --login.")
+    except Blocked as e:
+        await on_block(ctx.bot, e)
+    except (BudgetExceeded, CoolingDown):
+        pass
+    except Exception:
+        log.exception("reply check failed")
+    finally:
+        r = CFG.get("replies", {})
+        n0, n1 = CFG["poll"].get("night_hours", [1, 7])
+        mins = r.get("night_check_minutes", 60) if n0 <= datetime.now().hour < n1 else r.get("check_minutes", 12)
+        ctx.job_queue.run_once(inbox_tick, mins * 60 + random.uniform(0, 120), name="inbox")
+
+
+async def check_replies(bot):
+    if ctx_paused(bot) or GUARD.cooling_left() or not DB_.sent_rows():
+        return
+    convs = await inbox(WG_)
+    first_run = not DB_.kv_get("inbox_baseline", False)
+    names = set(DB_.kv_get("inbox_names", []) or [])
+    names.update(c["name"] for c in convs if c.get("name"))
+    DB_.kv_set("inbox_names", sorted(names))
+    sent = DB_.sent_rows()
+    drafts = [r["draft"] or "" for r in sent]
+    changed = False
+    for c in convs:
+        key = "conv:" + c["href"].split("nachrichten-id=")[-1].split("&")[0]
+        sig = f"{c['when']}|{c['text'][-200:]}"
+        if DB_.kv_get(key) == sig:
+            continue
+        DB_.kv_set(key, sig)
+        if looks_like_mine(c["text"], drafts):
+            continue  # the newest message in that chat is my own
+        rows = match_conversation(c, sent)
+        if len(rows) != 1:  # ambiguous / unknown: open the chat once to read the ad id
+            ad_id = await conversation_ad_id(WG_, c["href"])
+            rows = [r for r in sent if r["id"] == ad_id] if ad_id else []
+        preview = re.sub(r"\s+", " ", c["text"]).strip()[:300]
+        if rows:
+            r = rows[0]
+            if r["status"] != "replied":
+                DB_.update(r["id"], status="replied", reply_at=time.time(), reply_text=preview, conv_url=c["href"])
+                changed = True
+            else:
+                DB_.update(r["id"], reply_text=preview, conv_url=c["href"])
+                changed = True
+        if first_run:
+            continue  # first run only learns what's already there
+        title = rows[0]["title"] if rows else c["title"]
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("💬 Open chat", url=c["href"])]])
+        await bot.send_message(
+            CFG["telegram"]["chat_id"],
+            f"💬 <b>{html.escape(c['name'] or 'Someone')}</b> replied"
+            f"{' about ' + html.escape(title) if title else ''}\n\n<i>{html.escape(preview)}</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb,
+            disable_web_page_preview=True,
+        )
+    if first_run:
+        DB_.kv_set("inbox_baseline", True)
+    if changed:
+        write_excel(DB_.c, EXCEL)
+
+
+def ctx_paused(bot):
+    return APP.bot_data.get("paused", False)
+
+
+# ---------------- handlers ----------------
+async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.message.chat_id != CFG["telegram"]["chat_id"]:
+        return
+    action, lid = q.data.split(":", 1)
+    r = DB_.get(lid)
+    if not r:
+        await q.answer("Unknown listing")
+        return
+    l = Listing.from_dict(json.loads(r["data"]))
+
+    if action == "skip":
+        DB_.update(lid, status="skipped")
+        await q.answer("Skipped")
+        await q.edit_message_reply_markup(None)
+    elif action in ("edit", "rewrite"):
+        await q.answer()
+        ctx.user_data["pending"] = (action, lid)
+        prompt = (
+            "Send me the full new message text."
+            if action == "edit"
+            else "What should I change? (e.g. 'shorter', 'mention I can visit Saturday'). Send '.' for a fresh version."
+        )
+        await q.message.reply_text(prompt)
+    elif action == "send":
+        if r["status"] in ("sent", "already"):
+            await q.answer("Already sent")
+            return
+        if prev := DB_.same_person(l):
+            await q.answer("Already contacted this person", show_alert=True)
+            await q.message.reply_text(
+                f"⛔ Not sent: you already wrote to {l.poster or 'this advertiser'} "
+                f"about another ad ({prev['title'] or prev['id']})."
+            )
+            DB_.update(lid, status="same_person")
+            await q.edit_message_reply_markup(None)
+            return
+        await q.answer("Sending…")
+        await q.edit_message_reply_markup(None)
+        dry = CFG.get("send", {}).get("dry_run", True)
+        try:
+            status, shot, info = await WG_.send_message(l, r["draft"], dry_run=dry)
+        except LoggedOut:
+            status, shot, info = "failed", None, "Logged out of WG-Gesucht. Run `python bot.py --login`."
+        except CoolingDown as e:
+            status, shot, info = (
+                "failed",
+                None,
+                f"Not sending right now: {e} after a block. Try again later or send manually.",
+            )
+        except Blocked as e:
+            await on_block(ctx.bot, e)
+            status, shot, info = "failed", None, "WG-Gesucht blocked the send page."
+        except Exception as e:
+            log.exception("send failed")
+            status, shot, info = "failed", None, f"Error: {e}"
+        if status in ("sent", "already"):
+            DB_.update(lid, status=status, sent_at=time.time(), poster_id=l.poster_id or None)
+            try:
+                write_excel(DB_.c, EXCEL)
+            except Exception:
+                log.exception("excel export failed")
+        caption = f"{info}\n{l.url}"
+        if status == "failed":
+            caption = "❌ " + caption + "\nThe draft is in the card above – you can copy it and send manually."
+            await q.message.edit_reply_markup(keyboard(lid, l))
+        if shot and Path(shot).exists():
+            with open(shot, "rb") as f:
+                await ctx.bot.send_photo(q.message.chat_id, f, caption=caption[:1000])
+        else:
+            await q.message.reply_text(caption, disable_web_page_preview=True)
+
+
+async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    pending = ctx.user_data.pop("pending", None)
+    if not pending:
+        await update.message.reply_text("Send /help for commands, or paste an ad URL with /test <url>.")
+        return
+    action, lid = pending
+    r = DB_.get(lid)
+    text = update.message.text
+    if action == "edit":
+        draft = text
+    else:
+        await update.message.reply_text("✍️ Rewriting…")
+        l = Listing.from_dict(json.loads(r["data"]))
+        draft = await LLM_.rewrite(l, r["lang"] or "de", r["draft"], text, COMMUTE_.prompt_text(l.commute))
+    meta = json.loads(r["note"]) if (r["note"] or "").startswith("{") else {}
+    meta["translation"] = await english_version(draft, meta.get("keyword"))  # keep it in sync with the draft
+    DB_.update(lid, draft=draft, note=json.dumps(meta))
+    await post_card(ctx.bot, lid, with_photo=False)
+
+
+async def cmd_excel(update: Update, ctx):
+    path = write_excel(DB_.c, EXCEL)
+    with open(path, "rb") as f:
+        await update.message.reply_document(f, filename=Path(path).name, caption=f"{len(DB_.sent_rows())} applications")
+
+
+async def cmd_replies(update: Update, ctx):
+    await update.message.reply_text("📬 Checking inbox…")
+    try:
+        await check_replies(ctx.bot)
+        await update.message.reply_text("Done.")
+    except Exception as e:
+        await update.message.reply_text(f"Failed: {e}")
+
+
+async def cmd_help(update: Update, ctx):
+    await update.message.reply_text(
+        "/status – what I'm doing\n/check – poll now\n/replies – check inbox now\n"
+        "/excel – get the applications spreadsheet\n/pause, /resume\n"
+        "/test <ad url> – score + draft any ad (ignores filters)\n/login_check – am I logged in?"
+    )
+
+
+async def cmd_status(update: Update, ctx):
+    st = ctx.bot_data
+    await update.message.reply_text(
+        f"{'⏸ paused' if st['paused'] else '▶️ running'}\n"
+        f"Last poll: {st.get('last_poll', '–')} ({st.get('counts', {})} ads on page)\n"
+        f"Next check in ~{int(next_delay() // 60)} min · {GUARD.status()}\n"
+        f"Commute: {'on (' + COMMUTE_.provider + ')' if COMMUTE_.enabled else 'off'}\n"
+        f"Dry run: {CFG.get('send', {}).get('dry_run', True)}\n"
+        f"DB: {DB_.stats()}"
+    )
+
+
+async def cmd_pause(update: Update, ctx):
+    ctx.bot_data["paused"] = True
+    await update.message.reply_text("⏸ Paused")
+
+
+async def cmd_resume(update: Update, ctx):
+    ctx.bot_data["paused"] = False
+    await update.message.reply_text("▶️ Resumed")
+
+
+async def cmd_check(update: Update, ctx):
+    if GUARD.cooling_left():
+        await update.message.reply_text(
+            f"🧊 Cooling down after a block ({GUARD.cooling_left() // 60} min left), not checking."
+        )
+        return
+    await update.message.reply_text("🔎 Checking now…")
+    await poll_once(ctx)
+
+
+async def cmd_login_check(update: Update, ctx):
+    ok = await WG_.is_logged_in()
+    await update.message.reply_text("✅ Logged in" if ok else "❌ Not logged in – run python bot.py --login")
+
+
+async def cmd_test(update: Update, ctx):
+    if not ctx.args:
+        await update.message.reply_text("Usage: /test https://www.wg-gesucht.de/wg-zimmer-in-....html")
+        return
+    l = listing_from_url(ctx.args[0])
+    DB_.add(l, status="test")
+    await update.message.reply_text("⏳ Reading ad, checking commute, drafting…")
+    try:
+        await process(ctx.bot, l, force=True)
+    except Blocked as e:
+        await on_block(ctx.bot, e)
+    except Exception as e:
+        await update.message.reply_text(f"Failed: {e}")
+
+
+# ---------------- main ----------------
+async def post_init(app: Application):
+    await WG_.start()
+    await COMMUTE_.setup()
+    app.bot_data.update(paused=False, fails=0, n=0, counts={}, zeros={}, seeded={}, poll_lock=asyncio.Lock())
+    first = max(random.uniform(30, 90), GUARD.cooling_left() + 30 if GUARD.cooling_left() else 0)
+    app.job_queue.run_once(tick, first, name="poll")
+    if CFG.get("replies", {}).get("enabled", True):
+        app.job_queue.run_once(inbox_tick, first + random.uniform(60, 180), name="inbox")
+    try:  # 1 page load; sending and the Plus head start need the login
+        login = "logged in ✅" if await WG_.is_logged_in() else "⚠️ NOT logged in – run `python bot.py --login`"
+    except Exception as e:
+        login = f"login check failed ({e.__class__.__name__})"
+    await notify(
+        app.bot,
+        f"🤖 WG agent started – first check in {int(first)}s. {GUARD.status()}. "
+        f"Commute check: {'on' if COMMUTE_.enabled else 'OFF'}. WG-Gesucht: {login}. /help",
+    )
+
+
+async def post_shutdown(app: Application):
+    await WG_.stop()
+
+
+def main():
+    global CFG, DB_, WG_, LLM_, GUARD, COMMUTE_, APP, EXCEL
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default="config.yaml")
+    ap.add_argument("--login", action="store_true", help="open a visible browser to log in to WG-Gesucht")
+    a = ap.parse_args()
+    CFG = yaml.safe_load(Path(a.config).read_text(encoding="utf-8"))
+    CFG["telegram"]["chat_id"] = int(CFG["telegram"]["chat_id"])
+
+    DB_ = DB()
+    GUARD = RateGuard(DB_.c, CFG["poll"])
+    if a.login:
+        asyncio.run(interactive_login(guard=GUARD))  # its page loads count against the budget too
+        return
+
+    WG_ = WG(
+        headless=CFG["poll"].get("headless", True),
+        guard=GUARD,
+        block_resources=CFG["poll"].get("block_resources", True),
+    )
+    city = CFG.get("city", "München")
+    LLM_ = LLM(CFG["llm"], CFG["me"], city)
+    COMMUTE_ = Commute(CFG.get("commute"), DB_.kv_get, DB_.kv_set, city)
+
+    EXCEL = CFG.get("replies", {}).get("excel_path", "applications.xlsx")
+    app = APP = (
+        Application.builder()
+        .token(CFG["telegram"]["bot_token"])
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+    owner = filters.Chat(chat_id=CFG["telegram"]["chat_id"])
+    for name, fn in [
+        ("start", cmd_help),
+        ("help", cmd_help),
+        ("status", cmd_status),
+        ("pause", cmd_pause),
+        ("resume", cmd_resume),
+        ("check", cmd_check),
+        ("test", cmd_test),
+        ("login_check", cmd_login_check),
+        ("excel", cmd_excel),
+        ("replies", cmd_replies),
+    ]:
+        app.add_handler(CommandHandler(name, fn, filters=owner))
+    app.add_handler(CallbackQueryHandler(on_button))
+    app.add_handler(MessageHandler(owner & filters.TEXT & ~filters.COMMAND, on_text))
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+DB_: DB
+WG_: WG
+LLM_: LLM
+GUARD: RateGuard
+COMMUTE_: Commute
+APP: Application
+EXCEL = "applications.xlsx"
+
+if __name__ == "__main__":
+    main()
