@@ -7,7 +7,8 @@ before it's sent. Nothing is ever sent without the user tapping ✅. See README.
 ## Architecture
 - `bot.py`: Telegram bot (python-telegram-bot v21) and the main loop. Self-scheduling `tick()` →
   `_poll()` → card filter (`hard_filter`) → queue → `process()` (details → filters → repost and
-  same-person check → commute → LLM → card). Also `check_replies()` (inbox), `/excel`, `/test`.
+  same-person check, the same flat on another site (`same_flat`) → commute → LLM → card). Also
+  `check_replies()` (inbox), `/excel`, `/test`.
   `SITES` holds every supported site; a search's URL decides its site. Blocks, budgets and
   cooldowns are per site, so one site pushing back doesn't stop the others.
 - `sites.py`: what all sites share. `Listing` (ids of sites other than WG-Gesucht carry a prefix, e.g.

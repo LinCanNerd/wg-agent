@@ -26,7 +26,8 @@ the ad's language, and sends you a card in **Telegram**. **Nothing is ever sent 
 - **Real commute times** by bike and public transport to the places you choose, via the free
   [Transitous](https://transitous.org) routing service (Google Distance Matrix is optional).
   Ads that are too far away are dropped or flagged.
-- **No double messages:** skips reposts of the same flat and advertisers you've already written to.
+- **No double messages:** skips reposts of the same flat, the same flat advertised on the other site
+  (same text, or same street, size and rent), and advertisers you've already written to.
 - **LLM drafting:** scores the ad 0–10, spots scam signals and code words ("start your message with
   *Banane*"), answers questions the ad asks, and writes the message in German or English: casual
   "du" for WGs, polite "Sie" for studios. German drafts come with an English translation for you.

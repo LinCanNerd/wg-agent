@@ -115,6 +115,19 @@ class DB:
         ).fetchone()
         return r
 
+    def copy_on_other_site(self, l: Listing):
+        """The same flat, already handled as an ad on another site in the last 30 days: (row, why) or None."""
+        rows = self.c.execute(
+            "SELECT id, status, data, COALESCE(site, 'wg-gesucht') AS site FROM listings "
+            "WHERE COALESCE(site, 'wg-gesucht') <> ? AND created > ? "
+            "AND status IN ('pending','sent','replied','skipped','low_score','already')",
+            (l.site, time.time() - 30 * 86400),
+        ).fetchall()
+        for r in rows:
+            if why := same_flat(l, Listing.from_dict(json.loads(r["data"]))):
+                return r, why
+        return None
+
     def same_person(self, l: Listing):
         """Have I already written to this advertiser (any of their ads)?"""
         if l.poster_id:
@@ -160,6 +173,48 @@ def fingerprint(l: Listing) -> str:
     if not l.street and l.poster_id:  # only the postcode area is known: too vague without the advertiser
         fp += f"|{l.poster_id}"
     return fp
+
+
+def _street_name(l: Listing) -> str:
+    """'Plinganserstr. 12' and 'Plinganserstraße 12,' -> 'plinganserstraße'."""
+    s = re.split(r"\d", (l.street or "").lower())[0]
+    s = re.sub(r"[^a-zäöüß]", "", re.sub(r"str\.|strasse", "straße", s))
+    return s if len(s) > 4 else ""
+
+
+def _postcode(l: Listing) -> str:
+    m = re.search(r"\b(\d{5})\b", f"{l.address} {l.card_text[:300]}")
+    return m.group(1) if m else ""
+
+
+def _text_overlap(a: str, b: str) -> float | None:
+    """Share of the shorter ad text's 3-word phrases that the other one has too; None if too short to tell."""
+
+    def phrases(t):
+        w = re.findall(r"[a-zäöüß0-9]+", t.lower())
+        return {" ".join(w[i : i + 3]) for i in range(len(w) - 2)}
+
+    pa, pb = phrases(a), phrases(b)
+    if min(len(pa), len(pb)) < 12:
+        return None
+    return len(pa & pb) / min(len(pa), len(pb))
+
+
+def same_flat(a: Listing, b: Listing) -> str | None:
+    """Is b the same flat as a, advertised on another site? Returns why, or None. Both need details.
+    Agencies reuse their text for different flats, so the text alone isn't enough: size or rent must match."""
+    size_ok = bool(a.size and b.size and abs(a.size - b.size) <= 1)
+    rent_ok = bool(a.rent and b.rent and abs(a.rent - b.rent) <= max(30, 0.05 * max(a.rent, b.rent)))
+    text = _text_overlap(a.description, b.description)
+    if text is not None and text >= 0.6 and (size_ok or rent_ok):
+        return f"same ad text ({text:.0%})"
+    street = _street_name(a)
+    if street and street == _street_name(b) and size_ok and rent_ok:
+        return "same street, size and rent"
+    pc = _postcode(a)
+    if pc and pc == _postcode(b) and size_ok and rent_ok and text is not None and text >= 0.2:
+        return f"same postcode, size and rent, similar text ({text:.0%})"
+    return None
 
 
 # ---------------- filtering ----------------
@@ -464,7 +519,8 @@ def summary_text(hours=24):
         f"📋 <b>Daily review</b> ({datetime.now():%a %d %b}, last {hours} h)",
         f"• New ads: {len(rows)}" + (f" ({split})" if len(sites) > 1 else ""),
         f"• Filtered out automatically: {by.get('filtered', 0)}" + (f" ({top})" if top else ""),
-        f"• Reposts / already contacted: {by.get('repost', 0) + by.get('same_person', 0)}",
+        f"• Reposts / same flat on another site / already contacted: "
+        f"{by.get('repost', 0) + by.get('duplicate', 0) + by.get('same_person', 0)}",
         f"• Below your minimum score: {by.get('low_score', 0)}",
         f"• 🏠 Cards sent to you: {len(cards)}" + (f" (best {best}/10)" if best is not None else ""),
         f"• ✅ Messages sent: {sent} (total {sent_all})",
@@ -513,6 +569,12 @@ async def process(bot, l: Listing, force=False):
         if prev := DB_.repost_of(fp, l.id):
             DB_.update(l.id, status="repost", note=f"repost of {prev['id']} ({prev['status']})")
             log.info("repost %s of %s", l.id, prev["id"])
+            return
+        if dup := DB_.copy_on_other_site(l):  # e.g. the same room on WG-Gesucht and Kleinanzeigen
+            prev, why = dup
+            where = SITES[prev["site"]].label if prev["site"] in SITES else prev["site"]
+            DB_.update(l.id, status="duplicate", note=f"same flat as {where} ad {prev['id']} ({prev['status']}): {why}")
+            log.info("duplicate %s of %s ad %s: %s", l.id, where, prev["id"], why)
             return
 
     res, l.commute_text = await COMMUTE_.for_listing(l)
