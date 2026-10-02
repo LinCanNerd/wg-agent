@@ -128,9 +128,23 @@ class DB:
                 return r, why
         return None
 
+    def _poster_id_ok(self, pid):
+        """An advertiser id seen with more than 3 different names isn't one person's id (a parser mix-up,
+        like reading my own id from the logged-in page): don't block ads over it."""
+        names = {
+            json.loads(r[0]).get("poster")
+            for r in self.c.execute("SELECT data FROM listings WHERE poster_id=?", (pid,))
+        }
+        if len(names) > 3:
+            log.warning(
+                "advertiser id %s has %d different names: ignoring it for the same-person check", pid, len(names)
+            )
+            return False
+        return True
+
     def same_person(self, l: Listing):
         """Have I already written to this advertiser (any of their ads)?"""
-        if l.poster_id:
+        if l.poster_id and self._poster_id_ok(l.poster_id):
             r = self.c.execute(
                 "SELECT id, title FROM listings WHERE poster_id=? AND id<>? AND status IN ('sent','replied','already')",
                 (l.poster_id, l.id),

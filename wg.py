@@ -172,7 +172,9 @@ DETAIL_JS = r"""
   const send = document.querySelector('a[href*="nachricht-senden"]');
   const member = [...document.querySelectorAll('p')].find(p => /Mitglied seit/.test(p.textContent));
   const titleEl = document.querySelector('h1.detailed-view-title') || document.querySelector('h1');
-  const uid = document.querySelector('[data-user_id]');
+  // the advertiser's id sits on their phone-number popup, next to the ad id; logged in, the page also
+  // carries YOUR id in another [data-user_id], so never take just any of them
+  const uid = document.querySelector('#phone_numbers_modal[data-user_id], [data-user_id][data-asset_id]');
   // Only #gallery_slides: the page also holds map-pin, similar-ad and profile images of other people.
   const images = [...document.querySelectorAll('#gallery_slides img')]
     .map(i => i.getAttribute('data-src') || i.getAttribute('src') || '')   // later slides are lazy (data-src)
