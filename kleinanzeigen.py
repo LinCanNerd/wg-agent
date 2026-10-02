@@ -17,8 +17,8 @@ from sites import Listing, LoggedOut, Site, is_commercial
 
 log = logging.getLogger("kleinanzeigen")
 BASE = "https://www.kleinanzeigen.de"
-PREFIX = "ka:"  # Listing ids: "ka:3528834877", so they can't clash with WG-Gesucht ids
-ID_RE = re.compile(r"/(\d{8,12})-(\d+)-\d+")  # /s-anzeige/<slug>/3528834877-199-6414 (id, category)
+PREFIX = "ka:"  # Listing ids: "ka:1234567890", so they can't clash with WG-Gesucht ids
+ID_RE = re.compile(r"/(\d{8,12})-(\d+)-\d+")  # /s-anzeige/<slug>/1234567890-199-6411 (id, category)
 EURO_RE = re.compile(r"(\d[\d.]*)(?:,\d+)?\s*€")
 SIZE_RE = re.compile(r"(\d+)(?:,\d+)?\s*m²")
 DATE_RE = re.compile(r"(\d{2}\.\d{2}\.\d{4})")

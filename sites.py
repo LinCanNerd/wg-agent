@@ -55,7 +55,7 @@ class LoggedOut(Exception):
 
 @dataclass
 class Listing:
-    id: str  # WG-Gesucht ids as they are; other sites get a prefix ("ka:3528834877")
+    id: str  # WG-Gesucht ids as they are; other sites get a prefix ("ka:1234567890")
     url: str
     site: str = "wg-gesucht"
     title: str = ""

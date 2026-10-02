@@ -130,7 +130,7 @@ Everything lives in `config.yaml`; `config.example.yaml` documents every option.
     doesn't repeat it, and sentences where it invents where you live are dropped.
   - `full`: the model writes the whole message, following `message_guidelines`. More varied, but it
     tends to sound like an AI.
-  In both modes a code word found in the ad is always kept; a greeting-style one ("Servus Corps RP!")
+  In both modes a code word found in the ad is always kept; a greeting-style one ("Servus zusammen!")
   replaces the greeting.
 - **Other cities:** set `city`, use that city's search URLs, and adjust `districts_exclude` and
   `commute.viewbox`.

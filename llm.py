@@ -240,7 +240,7 @@ The part you write ("message"):
 - No praise and no opinions about the flat, the WG or the ad: no "super", "klasse", "toll", "cool",
   "perfekt", "wunderbar", "spannend", "gemütlich", "finde ich schön" (awesome, great, perfect, lovely,
   cozy, amazing). Never repeat their description back to them.
-- Never give my job as the reason for something ("Da ich in der Robotik arbeite, passt die Lage" makes no
+- Never give my job as the reason for something ("Da ich als Entwickler arbeite, passt die Lage" makes no
   sense).
 - If the ad asks applicants questions or to mention something (favourite dish, hobbies, why you...),
   add one short, casual sentence per question with the answer from MY PROFILE, unless my fixed text
@@ -395,7 +395,7 @@ class LLM:
         first = ""
         if keyword and subject:  # "write it in the subject line": alone on the first line, like a subject
             first = keyword
-        elif keyword and keyword_at_start and GREETING_RE.match(keyword):  # "Servus Corps RP!" is the greeting
+        elif keyword and keyword_at_start and GREETING_RE.match(keyword):  # "Servus zusammen!" is the greeting
             greet = keyword if keyword[-1] in ",!?." else f"{keyword} {name}," if name else f"{keyword},"
         elif keyword and keyword_at_start:  # the ad wants the code word first: its sentence opens the message
             parts = re.split(r"(?<=[.!?])\s+", body)
@@ -408,7 +408,7 @@ class LLM:
             msg = msg.replace("{" + k + "}", str(v or ""))
         msg = re.sub(r"[ \t]+\n", "\n", msg)
         msg = re.sub(r"\n{3,}", "\n\n", msg).strip()  # an empty {personal} leaves no gap
-        if greet[-1] in "!.?":  # "Servus Corps RP!" ends a sentence: what follows starts with a capital
+        if greet[-1] in "!.?":  # "Servus zusammen!" ends a sentence: what follows starts with a capital
             msg = re.sub(rf"({re.escape(greet)}\s+)(\w)", lambda m: m.group(1) + m.group(2).upper(), msg, count=1)
         if first:
             msg = f"{first}\n\n{msg}"
