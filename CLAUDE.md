@@ -1,6 +1,6 @@
 # wg-agent: notes for Claude Code
 
-WG-Gesucht flat-hunting agent. It polls WG-Gesucht searches, a local LLM scores each ad and drafts a
+Flat-hunting agent. It polls WG-Gesucht and Kleinanzeigen searches, a local LLM scores each ad and drafts a
 message in the ad's language (German or English), and the user approves every message in Telegram
 before it's sent. Nothing is ever sent without the user tapping ✅. See README.md for the user-facing docs.
 
@@ -19,6 +19,10 @@ before it's sent. Nothing is ever sent without the user tapping ✅. See README.
   straight to `/nachricht-senden/...`, checks `#message_timestamp`, and confirms success through the
   `api.php?action=conversations` response. Login is checked on `/nachrichten.html`, never the
   homepage (it looks the same logged in or out).
+- `kleinanzeigen.py`: Kleinanzeigen ("Auf Zeit & WG" c199, "Mietwohnungen" c203). Search cards have only
+  utility CSS classes, so `CARDS_JS` goes by structure; ad pages come in two A/B layouts (classic and
+  the 2026 redesign), both keep the `viewad-*` ids, and the redesign's coordinates come from its embedded
+  page data (`LOCATION_RE`). Sending and the inbox are not verified live yet (`send_verified = False`).
 - `guard.py`: request budget (pages per hour and per day) and escalating block cooldowns, one per site,
   saved to SQLite.
 - `commute.py`: Transitous `/api/v1/plan` (bike + transit) from the ad's `map_config` coordinates;

@@ -2,22 +2,25 @@
   <img src="banner.jpeg" alt="wg-agent: your flat-hunting sidekick for WG-Gesucht" width="100%">
 </p>
 
-A WG-Gesucht flat-hunting assistant that runs on your own machine. It watches your
-[WG-Gesucht](https://www.wg-gesucht.de) searches, uses an **LLM** (on your own machine or a cloud API) to score
-each new ad and write a personal first message in the ad's language, and sends you a card in **Telegram**.
-**Nothing is ever sent until you tap ✅.**
+A flat-hunting assistant that runs on your own machine. It watches your
+[WG-Gesucht](https://www.wg-gesucht.de) and [Kleinanzeigen](https://www.kleinanzeigen.de) searches, uses an
+**LLM** (on your own machine or a cloud API) to score each new ad and write a personal first message in
+the ad's language, and sends you a card in **Telegram**. **Nothing is ever sent until you tap ✅.**
 
-> **Disclaimer:** this is an unofficial personal tool, not affiliated with WG-Gesucht. Automated
-> access may be against the site's terms of use. Use it at your own risk, keep the request volume
+> **Disclaimer:** this is an unofficial personal tool, not affiliated with WG-Gesucht or Kleinanzeigen.
+> Automated access may be against the sites' terms of use. Use it at your own risk, keep the request volume
 > low (the defaults are conservative) and never remove the human approval step.
 
 ## Features
 
 - **Fast:** checks your searches every 2–3.5 minutes. With WG-Gesucht Plus, logged in, you also get
   Plus's head start on new ads.
+- **Two sites:** WG-Gesucht, and Kleinanzeigen's "Auf Zeit & WG" and "Mietwohnungen" categories. Each
+  site has its own page budget, so one site pushing back doesn't stop the other. ImmoScout24 and
+  Immowelt aren't supported: they show a captcha or block automated browsers right away.
 - **Cheap filtering first:** paid, partner and company ads, swap offers (Tauschangebote), old ads,
   ads over budget and ads for the other gender only are dropped from the search page, without opening them.
-- **Reads the whole ad:** all four description tabs (where code words hide), exact coordinates,
+- **Reads the whole ad:** all description tabs (where code words hide), exact coordinates,
   flatmates, who they're looking for, the advertiser's "member since" date and, with Plus, the number
   of applicants.
 - **Real commute times** by bike and public transport to the places you choose, via the free
@@ -30,8 +33,9 @@ each new ad and write a personal first message in the ad's language, and sends y
 - **Telegram approval:** photo album + card with commute, flatmates, score, warnings, notes and the
   draft. Buttons: `✅ Send` `❌ Skip` `✏️ Edit` `🔁 Rewrite` `🔗 Ad` `🗺 Map` `🚲 Route`.
 - **Safe sending:** goes straight to the contact form, refuses if you already wrote to that ad or
-  person, and confirms the message actually went out.
-- **Reply tracking:** checks your WG-Gesucht inbox, pings you in Telegram when someone answers, and
+  person, and confirms the message actually went out. Sending on Kleinanzeigen stays a dry run until
+  you switch it on (`sites.kleinanzeigen.dry_run`), because it hasn't been verified on the live site yet.
+- **Reply tracking:** checks your inboxes, pings you in Telegram when someone answers, and
   keeps an `applications.xlsx` log of everything you sent (`/excel`).
 
 ## How it works
@@ -41,16 +45,18 @@ search page ──► card filter ──► ad page ──► filters, repost & 
                                                    │
           Telegram card ◄── LLM score + draft ◄── commute (Transitous)
                 │
-          you tap ✅ ──► WG-Gesucht contact form ──► applications.xlsx ◄── inbox replies
+          you tap ✅ ──► the site's contact form ──► applications.xlsx ◄── inbox replies
 ```
 
 | File | What it does |
 |---|---|
 | `bot.py` | Telegram bot, main loop, filters, SQLite storage |
-| `wg.py` | WG-Gesucht access through a persistent, logged-in Chromium (Playwright); all page selectors |
+| `sites.py` | What all sites share: one persistent, logged-in Chromium (Playwright) and the `Site` interface |
+| `wg.py` | WG-Gesucht: search, ad page, contact form and inbox selectors |
+| `kleinanzeigen.py` | Kleinanzeigen: search, ad page (both 2026 layouts), contact form and inbox |
 | `llm.py` | Prompt, scoring, drafting, scam signals (any OpenAI-compatible API) |
 | `commute.py` | Bike and public transport times via Transitous / Nominatim (or Google) |
-| `guard.py` | Request budget and block cooldowns, saved across restarts |
+| `guard.py` | Request budget and block cooldowns per site, saved across restarts |
 | `tracker.py` | `applications.xlsx` export and matching inbox replies to sent ads |
 
 ## Requirements
@@ -61,7 +67,7 @@ search page ──► card filter ──► ad page ──► filters, repost & 
 - An LLM: a local one or a cloud API key. See [Choosing an LLM](#choosing-an-llm).
 - A Telegram bot token (from [@BotFather](https://t.me/BotFather)) and your Telegram user id
   (from [@userinfobot](https://t.me/userinfobot)).
-- A WG-Gesucht account (Plus is optional but helps).
+- A WG-Gesucht account (Plus is optional but helps), and a Kleinanzeigen account if you search there.
 
 ## Setup
 
@@ -72,12 +78,12 @@ pip install -r requirements.txt
 playwright install --with-deps chromium     # on ARM64, try without --with-deps if it fails
 
 cp config.example.yaml config.yaml          # then fill in everything marked TODO, and pick an LLM
-python bot.py --login                       # once: opens a browser window, log in to WG-Gesucht
+python bot.py --login                       # once: opens a browser window, log in to each site you search
 python bot.py
 ```
 
 In Telegram, open your bot and press **Start**. `--login` needs a display; on a headless server use
-`ssh -X` or VNC.
+`ssh -X` or VNC. `python bot.py --login kleinanzeigen` logs in to one site only.
 
 ## Choosing an LLM
 
@@ -105,7 +111,9 @@ Everything lives in `config.yaml`; `config.example.yaml` documents every option.
 - **`me:`** is who you are. The model only uses facts written here, so be complete and honest. If an
   ad asks something your profile doesn't answer (smoker? pets?), the model may guess.
   `preferences` tells it how to score; `message_guidelines` tells it how to write.
-- **`search.searches`:** one entry per WG-Gesucht search URL, each with its own budget and minimum score.
+- **`search.searches`:** one entry per search URL (WG-Gesucht or Kleinanzeigen), each with its own
+  budget and minimum score.
+- **`sites:`** per-site settings: `dry_run` and that site's own page budget.
 - **`commute.destinations`:** the places you travel to, with limits. `action: exclude` drops ads that
   are too far; `mark` only adds a warning.
 - **`me.mode`:**
@@ -119,7 +127,8 @@ Everything lives in `config.yaml`; `config.example.yaml` documents every option.
 
 Keep `send.dry_run: true` and send `/test <ad url>` for a few ads. Pressing ✅ then fills in the
 contact form and sends you a screenshot instead of sending. When you're happy with the drafts, set
-`dry_run: false`.
+`dry_run: false`. Kleinanzeigen has its own switch, `sites.kleinanzeigen.dry_run`: check a dry-run
+screenshot there first.
 
 ## Telegram commands
 
@@ -131,18 +140,18 @@ contact form and sends you a screenshot instead of sending. When you're happy wi
 | `/excel` | get `applications.xlsx` |
 | `/pause`, `/resume` | stop / restart polling |
 | `/test <url>` | score and draft any ad (ignores filters) |
-| `/login_check` | is the browser still logged in to WG-Gesucht? |
+| `/login_check` | is the browser still logged in to each site? |
 
-## Staying polite to WG-Gesucht
+## Staying polite to the sites
 
 `guard.py` makes sure the agent stays well below anything that looks like scraping:
 
-- Every page load counts against a budget of 40 per hour and 650 per day, saved to disk so restarts
-  don't reset it. Normal use is about 30 per hour.
+- Every page load counts against that site's budget of 40 per hour and 650 per day, saved to disk so
+  restarts don't reset it. Normal use is about 30 per hour per site.
 - Searches run at random intervals (2–3.5 min, every ~20 min at night). At most 3 ads are opened per
   check, freshest first.
 - A captcha, HTTP 403/429/503, the terms-of-use block page, or a search that suddenly comes back empty
-  pauses everything for 15 min, then 1 h, 3 h and 12 h for repeat blocks, and you get a Telegram note.
+  pauses that site for 15 min, then 1 h, 3 h and 12 h for repeat blocks, and you get a Telegram note.
   There is no captcha solving and no anti-detection stealth.
 - Images and fonts are never downloaded; Telegram fetches the photos itself.
 - Routing requests (Transitous / OpenStreetMap) are throttled to 1 per second and cached.
@@ -161,10 +170,11 @@ journalctl --user -u wg-agent -f
 
 ## Troubleshooting
 
-- **0 listings parsed / nothing found:** WG-Gesucht changes its HTML now and then. All selectors are
-  in `wg.py` (`CARDS_JS`, `DETAIL_JS`, `INBOX_JS`, `send_message`).
+- **0 listings parsed / nothing found:** the sites change their HTML now and then. The selectors are
+  in `wg.py` and `kleinanzeigen.py` (`CARDS_JS`, `DETAIL_JS`, `INBOX_JS`, `send_message`).
 - **Logged out:** WG-Gesucht needs a session-only cookie; the agent saves it in `browser-session.json`
-  and restores it on start. If the server-side session expires, run `python bot.py --login` again.
+  and restores it on start. If the server-side session expires, run `python bot.py --login` again
+  (or `--login kleinanzeigen` for just that site).
 - **Send problems:** a screenshot of every send attempt lands in `screenshots/`.
 - **Commute missing:** check the destination coordinates logged at startup, or set `lat`/`lng` yourself.
 
@@ -172,7 +182,7 @@ journalctl --user -u wg-agent -f
 
 Your `config.yaml`, the browser profile and session, the database, the spreadsheet and the screenshots
 are personal and are all in `.gitignore`. Don't commit them. With a local LLM nothing leaves your machine
-except the WG-Gesucht, Telegram and routing requests; with a cloud LLM, your `me:` profile and the text
+except the requests to the flat sites, Telegram and the routing service; with a cloud LLM, your `me:` profile and the text
 of each ad are also sent to that provider.
 
 ## Credits

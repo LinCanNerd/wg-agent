@@ -27,6 +27,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 
 from commute import Commute
 from guard import BudgetExceeded, CoolingDown, RateGuard
+from kleinanzeigen import Kleinanzeigen
 from llm import LLM, detect_language, first_name, has_number
 from sites import Blocked, Browser, Listing, LoggedOut, Site, interactive_login
 from tracker import looks_like_mine, match_conversation, write_excel
@@ -37,7 +38,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("agent")
 
 CFG: dict = {}
-SITE_TYPES = (WGGesucht,)
+SITE_TYPES = (WGGesucht, Kleinanzeigen)
 SITES: dict[str, Site] = {}  # every supported site; only the ones with a search are polled
 
 

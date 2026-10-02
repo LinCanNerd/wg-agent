@@ -65,10 +65,11 @@ poll:
   skip_existing_on_start: true  # don't open every ad that's already online on the first run
 
 search:
-  # One entry per search. The agent adds newest-first sorting, "no Tauschangebote", max rent and
-  # min size to the URL automatically, so WG-Gesucht does most of the filtering. You can also paste
-  # a search URL from the site with your own filters. For another city, open its WG-Gesucht search
-  # page and copy the URL (the number after the city name is the city id; Munich = 90).
+  # One entry per search; the URL decides the site (WG-Gesucht or Kleinanzeigen). The agent adds
+  # newest-first sorting, max rent and the site's other filters to the URL automatically, so the site
+  # does most of the filtering. You can also paste a search URL from the site with your own filters.
+  # For another city, open its search page and copy the URL (WG-Gesucht: the number after the city
+  # name is the city id, Munich = 90; Kleinanzeigen: the l-number at the end, Munich = l6411).
   searches:
     - kind: room                    # WG room
       url: "https://www.wg-gesucht.de/wg-zimmer-in-Muenchen.90.0.1.0.html"
@@ -82,6 +83,20 @@ search:
       min_score: 8                  # only show really good ones
       every_n_polls: 3              # every 3rd poll (~every 8 min)
       max_ad_age_hours: 72
+    # Kleinanzeigen (optional): "Auf Zeit & WG" for rooms, "Mietwohnungen" for flats. Each site has its
+    # own page budget. Run `python bot.py --login kleinanzeigen` once before you rely on sending there.
+    # - kind: room
+    #   url: "https://www.kleinanzeigen.de/s-auf-zeit-wg/muenchen/c199l6411"
+    #   max_rent: 800
+    #   min_score: 6
+    #   every_n_polls: 2
+    #   max_ad_age_hours: 48
+    # - kind: studio                # zimmer_d:1,1.5 = 1 to 1.5 rooms
+    #   url: "https://www.kleinanzeigen.de/s-wohnung-mieten/muenchen/c203l6411+wohnung_mieten.zimmer_d:1,1.5"
+    #   max_rent: 1100
+    #   min_score: 8
+    #   every_n_polls: 4
+    #   max_ad_age_hours: 72
 
   # Extra hard filters applied by the agent (leave empty / 0 to disable)
   min_size: 12
@@ -123,6 +138,12 @@ language: auto      # auto | de | en  (auto = language of the ad)
 
 send:
   dry_run: true     # true = fill the form + screenshot but DON'T press send. Set false when happy.
+
+sites:              # per-site settings (all optional)
+  kleinanzeigen:
+    dry_run: true   # overrides send.dry_run there; sending on Kleinanzeigen stays a dry run until you set false
+    # max_pages_per_hour: 40      # its own page budget; defaults to the poll: values
+    # max_pages_per_day: 650
 
 # Everything below is about you. The model only uses facts written here, so be complete and honest:
 # if an ad asks something your profile doesn't answer (smoker? pets?), the model may guess.
