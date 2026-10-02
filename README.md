@@ -1,8 +1,4 @@
-<p align="center">
-  <img src="logo.jpeg" alt="wg-agent logo" width="220">
-</p>
-
-# wg-agent
+# <img src="logo.jpeg" alt="wg-agent logo" width="56" align="center"> wg-agent
 
 A WG-Gesucht flat-hunting assistant that runs on your own machine. It watches your
 [WG-Gesucht](https://www.wg-gesucht.de) searches, uses an **LLM** (on your own machine or a cloud API) to score
