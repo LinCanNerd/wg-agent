@@ -42,6 +42,8 @@ before it's sent. Nothing is ever sent without the user tapping ✅. See README.
   `applications.xlsx` or `screenshots/` (personal data, session cookies). They are in `.gitignore`.
 - New config keys need a default in code, so existing `config.yaml` files keep working.
 - Format and lint with `uvx ruff format . && uvx ruff check .` (settings in `pyproject.toml`).
+- Whenever you show a German message draft in chat (or quote German ad text), put an English translation
+  right next to it, every time: whoever runs the agent may not read German.
 
 ## Personal context
 A private `CLAUDE.local.md` (gitignored) may hold the user's own situation and setup notes.
