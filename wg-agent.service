@@ -17,6 +17,7 @@ Restart=always
 RestartSec=30
 # stop only the bot: it saves the WG-Gesucht session, then closes its own Chromium
 KillMode=mixed
+TimeoutStopSec=120
 
 [Install]
 WantedBy=default.target

@@ -15,7 +15,9 @@ import re
 import sqlite3
 import time
 from datetime import datetime
+from datetime import time as dtime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import yaml
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
@@ -24,7 +26,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 
 from commute import Commute
 from guard import BudgetExceeded, CoolingDown, RateGuard
-from llm import LLM, detect_language, first_name
+from llm import LLM, detect_language, first_name, has_number
 from tracker import looks_like_mine, match_conversation, write_excel
 from wg import (
     WG,
@@ -291,11 +293,14 @@ def card_text(l: Listing, r, meta, with_translation=True):
         lines.append(f"🔑 Code word <b>{e(kw)}</b> ({'must be the first word' if at_start else 'anywhere'}) {status}")
         if sentence:
             lines.append(f"      ↳ <i>{e(sentence[:300])}</i>")
+    if (phone := CFG["me"].get("whatsapp")) and not has_number(r["draft"] or "", phone):
+        lines.append("⚠️ Your WhatsApp number is missing from the draft (or a digit is wrong)")
     if meta.get("questions"):
         lines.append(f"❓ Answered: {e(meta['questions'])}")
     if meta.get("notes"):
         lines.append("\n<b>Notes:</b>\n" + "\n".join(f"📝 {e(n)}" for n in meta["notes"]))
-    lines.append(f"\n<b>Draft:</b>\n<pre>{e((r['draft'] or '')[:3000])}</pre>")
+    draft = (r["draft"] or "").strip() or "(no draft: the model rejected this ad. Use 🔁 Rewrite to get one anyway)"
+    lines.append(f"\n<b>Draft:</b>\n<pre>{e(draft[:3000])}</pre>")
     if with_translation and meta.get("translation"):
         lines.append(
             f"<b>🇬🇧 In English (just for you, not sent):</b>\n"
@@ -367,8 +372,81 @@ async def english_version(text, keyword=""):
         return ""
 
 
-async def notify(bot, text):
+async def notify(bot, text, important=False):
+    """Agent updates. With telegram.quiet they wait for the daily summary; `important` ones (you have to act,
+    or you asked) are always sent right away."""
+    if CFG["telegram"].get("quiet") and not important:
+        log.info("for the daily summary: %s", text)
+        events = [ev for ev in DB_.kv_get("events", []) if ev["t"] > time.time() - 7 * 86400]
+        DB_.kv_set("events", events + [{"t": time.time(), "text": text}])
+        return
     await bot.send_message(CFG["telegram"]["chat_id"], text, disable_web_page_preview=True)
+
+
+FILTER_REASONS = [  # how hard_filter / commute notes start -> words for the daily summary
+    (r"^rent", "too expensive"),
+    (r"^size", "too small"),
+    (r"^old ad", "online too long"),
+    (r"^Tauschangebot", "swap offer"),
+    (r"^keyword", "excluded word"),
+    (r"^district", "outside the city"),
+    (r"only$", "wrong gender"),
+    (r"^free from", "free too late"),
+    (r"^only ", "sublet too short"),
+    (r"^too far from", "too far from work"),
+]
+
+
+def summary_text(hours=24):
+    since = time.time() - hours * 3600
+    rows = DB_.c.execute(
+        "SELECT status, score, note FROM listings WHERE created > ? AND status <> 'preexisting'", (since,)
+    ).fetchall()
+    by = {}
+    for r in rows:
+        by[r["status"]] = by.get(r["status"], 0) + 1
+    reasons = {}
+    for r in rows:
+        if r["status"] == "filtered":
+            label = next((lbl for pat, lbl in FILTER_REASONS if re.search(pat, r["note"] or "")), "other")
+            reasons[label] = reasons.get(label, 0) + 1
+    cards = [r for r in rows if r["status"] in ("pending", "sent", "skipped", "already", "replied")]
+    sent = DB_.c.execute("SELECT COUNT(*) FROM listings WHERE sent_at > ?", (since,)).fetchone()[0]
+    replies = DB_.c.execute("SELECT COUNT(*) FROM listings WHERE reply_at > ?", (since,)).fetchone()[0]
+    sent_all = len(DB_.sent_rows())
+    replied_all = DB_.c.execute("SELECT COUNT(*) FROM listings WHERE reply_at IS NOT NULL").fetchone()[0]
+    waiting = DB_.c.execute("SELECT COUNT(*) FROM listings WHERE status='pending'").fetchone()[0]
+    events = [ev for ev in DB_.kv_get("events", []) if ev["t"] > since]
+    best = max((r["score"] for r in cards if r["score"] is not None), default=None)
+
+    top = ", ".join(f"{n} {lbl}" for lbl, n in sorted(reasons.items(), key=lambda x: -x[1])[:4])
+    lines = [
+        f"📋 <b>Daily review</b> ({datetime.now():%a %d %b}, last {hours} h)",
+        f"• New ads: {len(rows)}",
+        f"• Filtered out automatically: {by.get('filtered', 0)}" + (f" ({top})" if top else ""),
+        f"• Reposts / already contacted: {by.get('repost', 0) + by.get('same_person', 0)}",
+        f"• Below your minimum score: {by.get('low_score', 0)}",
+        f"• 🏠 Cards sent to you: {len(cards)}" + (f" (best {best}/10)" if best is not None else ""),
+        f"• ✅ Messages sent: {sent} (total {sent_all})",
+        f"• 💬 Replies: {replies} (total {replied_all})",
+        f"• ⏳ Cards waiting for your decision: {waiting}",
+    ]
+    if by.get("stale") or by.get("error") or by.get("gone"):
+        lines.append(
+            f"• Not processed: {by.get('stale', 0)} too old in the queue, {by.get('error', 0)} errors, "
+            f"{by.get('gone', 0)} taken offline first"
+        )
+    lines.append(f"• WG-Gesucht {html.escape(GUARD.status())}")
+    if events:
+        lines.append(f"• Agent notes ({len(events)}):")
+        lines += [f"   – {datetime.fromtimestamp(ev['t']):%H:%M} {html.escape(ev['text'][:160])}" for ev in events[-5:]]
+    return "\n".join(lines)
+
+
+async def daily_summary(ctx: ContextTypes.DEFAULT_TYPE):
+    await ctx.bot.send_message(
+        CFG["telegram"]["chat_id"], summary_text(), parse_mode=ParseMode.HTML, disable_web_page_preview=True
+    )
 
 
 # ---------------- core pipeline ----------------
@@ -379,7 +457,7 @@ async def process(bot, l: Listing, force=False):
     except LookupError as e:
         DB_.update(l.id, status="gone", note=str(e))
         if force:
-            await notify(bot, f"Couldn't read the ad: {e}")
+            await notify(bot, f"Couldn't read the ad: {e}", important=True)  # you asked with /test
         return
     fp = fingerprint(l)
     DB_.update(l.id, data=l, title=l.title, fp=fp, poster_id=l.poster_id or None)
@@ -548,7 +626,9 @@ async def inbox_tick(ctx: ContextTypes.DEFAULT_TYPE):
     try:
         await check_replies(ctx.bot)
     except LoggedOut:
-        await notify(ctx.bot, "⚠️ Can't read your inbox: logged out of WG-Gesucht. Run python bot.py --login.")
+        await notify(
+            ctx.bot, "⚠️ Can't read your inbox: logged out of WG-Gesucht. Run python bot.py --login.", important=True
+        )
     except Blocked as e:
         await on_block(ctx.bot, e)
     except (BudgetExceeded, CoolingDown):
@@ -683,6 +763,9 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if status == "failed":
             caption = "❌ " + caption + "\nThe draft is in the card above – you can copy it and send manually."
             await q.message.edit_reply_markup(keyboard(lid, l))
+        elif status == "dry_run":  # keep the card usable: after switching dry_run off, ✅ sends it for real
+            caption = "🧪 " + caption + "\nTo really send it: set send.dry_run: false and restart, then press ✅ again."
+            await q.message.edit_reply_markup(keyboard(lid, l))
         if shot and Path(shot).exists():
             with open(shot, "rb") as f:
                 await ctx.bot.send_photo(q.message.chat_id, f, caption=caption[:1000])
@@ -729,8 +812,13 @@ async def cmd_help(update: Update, ctx):
     await update.message.reply_text(
         "/status – what I'm doing\n/check – poll now\n/replies – check inbox now\n"
         "/excel – get the applications spreadsheet\n/pause, /resume\n"
-        "/test <ad url> – score + draft any ad (ignores filters)\n/login_check – am I logged in?"
+        "/test <ad url> – score + draft any ad (ignores filters)\n/login_check – am I logged in?\n"
+        "/summary – the daily review right now"
     )
+
+
+async def cmd_summary(update: Update, ctx):
+    await update.message.reply_text(summary_text(), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
 async def cmd_status(update: Update, ctx):
@@ -794,14 +882,20 @@ async def post_init(app: Application):
     app.job_queue.run_once(tick, first, name="poll")
     if CFG.get("replies", {}).get("enabled", True):
         app.job_queue.run_once(inbox_tick, first + random.uniform(60, 180), name="inbox")
+    if hhmm := CFG["telegram"].get("daily_summary"):
+        h, m = map(int, str(hhmm).split(":"))
+        app.job_queue.run_daily(daily_summary, dtime(h, m, tzinfo=ZoneInfo("Europe/Berlin")), name="summary")
+    logged_in = True
     try:  # 1 page load; sending and the Plus head start need the login
-        login = "logged in ✅" if await WG_.is_logged_in() else "⚠️ NOT logged in – run `python bot.py --login`"
+        logged_in = await WG_.is_logged_in()
+        login = "logged in ✅" if logged_in else "⚠️ NOT logged in – run `python bot.py --login`"
     except Exception as e:
         login = f"login check failed ({e.__class__.__name__})"
     await notify(
         app.bot,
         f"🤖 WG agent started – first check in {int(first)}s. {GUARD.status()}. "
         f"Commute check: {'on' if COMMUTE_.enabled else 'OFF'}. WG-Gesucht: {login}. /help",
+        important=not logged_in,  # quiet mode: only bother you if you need to log in again
     )
 
 
@@ -853,6 +947,7 @@ def main():
         ("login_check", cmd_login_check),
         ("excel", cmd_excel),
         ("replies", cmd_replies),
+        ("summary", cmd_summary),
     ]:
         app.add_handler(CommandHandler(name, fn, filters=owner))
     app.add_handler(CallbackQueryHandler(on_button))

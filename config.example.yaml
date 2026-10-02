@@ -9,6 +9,8 @@ telegram:
   chat_id: 123456789          # TODO: your own Telegram user id (ask @userinfobot)
   photos: true                # send the ad's photos as an album above each card
   max_photos: 10              # Telegram allows at most 10 per album
+  quiet: false               # true = only house cards, replies and must-act alerts; the rest waits
+  daily_summary: "21:00"      # daily review of the last 24 h (quotes needed); "" = off; /summary any time
 
 llm:
   # Any OpenAI-compatible API works: a model on your own machine, or a cloud provider (no GPU needed).
@@ -126,6 +128,7 @@ send:
 # if an ad asks something your profile doesn't answer (smoker? pets?), the model may guess.
 me:
   name: "Alex"                   # TODO: your first name (used to sign messages)
+  whatsapp: ""                   # optional, e.g. "+49 151 23456789": added to every draft, checked digit by digit
   gender: m                      # m / w: skips WG ads that only want the other gender
   mode: full                     # full = the model writes the whole message
                                  # template = the model writes only 2-4 tailored sentences that go into

@@ -44,6 +44,12 @@ def detect_language(text: str) -> str:
     return "en" if en > de * 1.2 else "de"
 
 
+def has_number(text: str, phone: str) -> bool:
+    """True if every digit of `phone` appears in order in `text`, whatever the spacing ("+39 324…" / "0039324…")."""
+    want = re.sub(r"\D", "", phone)
+    return bool(want) and want.lstrip("0") in re.sub(r"\D", "", text)
+
+
 def first_name(poster: str) -> str:
     """'Anna Schmidt' -> 'Anna'; skips company-ish names and initials-only."""
     p = (poster or "").strip()
@@ -109,11 +115,19 @@ class LLM:
         self.client = AsyncOpenAI(base_url=cfg["base_url"], api_key=key)
 
     def _profile(self):
+        whatsapp = f"MY WHATSAPP: {self.me['whatsapp']}\n\n" if self.me.get("whatsapp") else ""
         return (
-            f"MY NAME: {self.me['name']}\n\nMY PROFILE:\n{self.me['profile']}\n\n"
+            f"MY NAME: {self.me['name']}\n\n{whatsapp}MY PROFILE:\n{self.me['profile']}\n\n"
             f"MY PREFERENCES:\n{self.me['preferences']}\n\n"
             f"MESSAGE GUIDELINES:\n{self.me['message_guidelines']}"
         )
+
+    def with_contact(self, msg: str) -> str:
+        """Safety net: a model can drop or garble a digit, so the number is checked digit by digit."""
+        phone = str(self.me.get("whatsapp") or "").strip()
+        if not phone or has_number(msg, phone):
+            return msg
+        return f"{msg.rstrip()}\nWhatsApp: {phone}"
 
     @staticmethod
     def _ad(l, commute_text=""):
@@ -214,6 +228,10 @@ class LLM:
         d["keyword_at_start"] = bool(d["keyword"]) and str(d.get("keyword_at_start")).lower() == "true"
         msg = (d.get("message") or "").strip()
         if len(msg.split()) < 8:
+            # it rejected the ad (e.g. day rentals only) and wrote nothing: that's a low score, not an error
+            if d["score"] <= 3:
+                d["message"] = ""
+                return d
             raise ValueError(f"LLM returned no usable message: {raw[:300]}")
         if self.me.get("mode", "full") == "template":
             msg = self._wrap_template(listing, lang, msg, d["keyword"])
@@ -231,7 +249,7 @@ class LLM:
             ).strip()
             if kw.lower() not in msg.lower():
                 msg = f"{kw}\n\n{msg}"  # last resort: never lose the code word (the card flags it)
-        d["message"] = msg
+        d["message"] = self.with_contact(msg)
         flags = scam_signals(listing.title + " " + listing.description)
         if flags:
             d["red_flags"] = "; ".join(filter(None, [d["red_flags"]] + flags))
@@ -243,7 +261,7 @@ class LLM:
         system = (
             f"Rewrite a message answering a flat/WG ad. Write ONLY in {language}. "
             f"{REGISTER.get(listing.kind, REGISTER['room'])} Use only facts from the profile; keep any "
-            "code word from the previous draft. Output only the new message text, nothing else."
+            "code word and my WhatsApp number from the previous draft. Output only the new message text, nothing else."
         )
         user = (
             self._profile()
@@ -252,7 +270,7 @@ class LLM:
             + f"\n\n=== PREVIOUS DRAFT ===\n{previous}\n\n=== WHAT TO CHANGE ===\n"
             + (feedback if feedback.strip() not in ("", ".") else "Write a fresh, different version.")
         )
-        return await self._chat(system, user, want_json=False)
+        return self.with_contact(await self._chat(system, user, want_json=False))
 
     async def translate(self, text: str, keyword: str = "") -> str:
         """English version of a German draft, only shown to me in Telegram (never sent)."""
