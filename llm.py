@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+from datetime import date
 
 from openai import AsyncOpenAI
 
@@ -48,6 +49,20 @@ def has_number(text: str, phone: str) -> bool:
     """True if every digit of `phone` appears in order in `text`, whatever the spacing ("+39 324…" / "0039324…")."""
     want = re.sub(r"\D", "", phone)
     return bool(want) and want.lstrip("0") in re.sub(r"\D", "", text)
+
+
+# Sentences a template-mode part must never contain: a claim about where I live (the model mixes that up
+# with the flat's location) or a refusal to answer. Dropping them is safe: the fixed text carries the message.
+BAD_SENTENCE = re.compile(
+    r"\bich wohne\b|\bda ich (in|im|am) [^.!?]{0,40}\bwohne\b|\bi (currently )?live (in|near|at)\b|"
+    r"keine angaben|kann ich (leider )?nicht(s)? sagen|can'?t (say|tell|share)|no information",
+    re.I,
+)
+
+
+def drop_bad_sentences(text: str) -> str:
+    parts = re.split(r"(?<=[.!?])\s+", text.strip())
+    return " ".join(s for s in parts if not BAD_SENTENCE.search(s))
 
 
 def first_name(poster: str) -> str:
@@ -99,6 +114,52 @@ Return strict JSON only:
              and how the message handles it>"],
   "message": "<the message>"}}"""
 
+# Template mode: your own fixed message is sent word for word; the model only writes the small part that
+# depends on the ad (it goes where {personal} is) and judges the ad.
+SYSTEM_TEMPLATE = """You help one person find a home in {city}. Ads are WG rooms or studios (TYPE says which).
+Read the whole ad (all sections) and judge the fit. The message itself is my own fixed text; you only
+write the small part that depends on this ad, which goes into the middle of my text.
+
+Scoring (0-10): commute and location matter most (use the COMMUTE numbers, never guess), then
+price/size, WG vibe or studio quality, availability date, and who they are looking for
+(age/gender requirements I don't meet = low score). Scam signs = score 0-2.
+
+The part you write ("message"):
+- Write ONLY in {language}, even if the ad or my profile uses another language. {register}
+- One short, plain sentence (at most 25 words) saying why this place works for me, linking one concrete
+  fact from the ad to one fact from MY PROFILE (e.g. close to my work, they cook together and I like
+  cooking, an international WG). Write it the way a normal person types a quick message.
+- MY FIXED TEXT is shown below: never repeat anything it already says (my age, job, origin, hobbies,
+  cooking, smoking, pets, languages, viewing, contact). Add only what is new.
+- Use ONLY facts from MY PROFILE. Never invent anything (study subject, where I live now, dates). The
+  flat's location is not where I live: wrong "Da ich in der Altstadt wohne, ...", right "Von hier wäre
+  ich schnell bei der Arbeit in ...". If the ad asks something my profile doesn't answer, leave it out
+  (don't write that you can't answer) and say so in "notes".
+- Never praise the flat or the ad, never repeat their description back to them, no adjectives like
+  wonderful, perfect, charming, cosy, exciting (wunderbar, perfekt, spannend, gemütlich, charmant, toll).
+- If the ad asks applicants questions or to mention something (favourite dish, hobbies, why you...),
+  add one short, casual sentence per question with the answer from MY PROFILE, unless my fixed text
+  already answers it.
+- If the ad has a code word / Stichwort / instruction like "start your message with...", "mention the
+  word...": put it in "keyword" and use the word in one short, natural sentence here (e.g. Banane ->
+  "Banane im Müsli ist übrigens mein Frühstück."), never as a bare word.
+- Nothing else: no greeting, no introduction of myself, no German level, no viewing or contact
+  details, no sign-off. My fixed text already has all of that.
+
+Return strict JSON only:
+{{"score": <0-10 integer>,
+  "reasons": "<one short English sentence: why this score>",
+  "commute_ok": <true|false, is the commute feasible for me given the numbers>,
+  "red_flags": "<scam signs or dealbreakers, English, or empty string>",
+  "keyword": "<code word the ad asks for, or empty string>",
+  "keyword_at_start": <true only if the ad says the message must begin with the code word>,
+  "questions": "<questions in the ad that I answered, or empty string>",
+  "notes": ["<2-5 short English notes for ME only (never sent): what stands out about the place, good or
+             bad (furnished?, deposit, extra costs, limited duration, condition, floor...), and any test or
+             trick hidden in the ad (code word, questions to answer, 'write in German', documents wanted),
+             and anything the ad asks for that my fixed text doesn't cover>"],
+  "message": "<the part you write>"}}"""
+
 REGISTER = {
     "room": 'WG style: casual, "du"/"ihr" in German.',
     "studio": 'Studio: polite and a bit formal, "Sie" in German; stress reliability, stable job, documents.',
@@ -116,11 +177,22 @@ class LLM:
 
     def _profile(self):
         whatsapp = f"MY WHATSAPP: {self.me['whatsapp']}\n\n" if self.me.get("whatsapp") else ""
+        guidelines = self.me["message_guidelines"]
+        if self.template_mode:  # length and layout rules would pull the model back into writing a whole message
+            guidelines = (
+                "(Written for a whole message. For your small part, follow only the content rules: what never "
+                "to mention, du/Sie, which facts to use. Ignore length, structure and closing rules.)\n" + guidelines
+            )
         return (
             f"MY NAME: {self.me['name']}\n\n{whatsapp}MY PROFILE:\n{self.me['profile']}\n\n"
             f"MY PREFERENCES:\n{self.me['preferences']}\n\n"
-            f"MESSAGE GUIDELINES:\n{self.me['message_guidelines']}"
+            f"MESSAGE GUIDELINES:\n{guidelines}"
         )
+
+    def _template(self, kind, lang):
+        tpls = self.me.get("templates") or {}
+        kind = kind if kind in ("room", "studio") else "room"
+        return tpls.get(f"{kind}_{lang}") or tpls.get(f"room_{lang}") or tpls.get(lang) or ""
 
     def with_contact(self, msg: str) -> str:
         """Safety net: a model can drop or garble a digit, so the number is checked digit by digit."""
@@ -138,7 +210,7 @@ class LLM:
         )
         name = first_name(l.poster)
         return (
-            f"TYPE: {kind}\nTITLE: {l.title}\n"
+            f"TODAY: {date.today():%d.%m.%Y}\nTYPE: {kind}\nTITLE: {l.title}\n"
             f"CONTACT NAME: {name or 'unknown - do not use a name'}\n"
             f"RENT: {l.rent} €  SIZE: {l.size} m²  ADDRESS: {l.address or l.street + ', ' + l.district}\n"
             f"AVAILABLE: {l.available_from} – {l.available_to or 'open-ended'}\n"
@@ -148,18 +220,17 @@ class LLM:
             f"KEY FACTS: {l.details}\n\nAD TEXT:\n{l.description}"
         )
 
+    @property
+    def template_mode(self):
+        return self.me.get("mode", "full") == "template"
+
     def _system(self, lang, kind):
         language = "German" if lang == "de" else "English"
-        if self.me.get("mode", "full") == "template":
-            length = (
-                '"message" must be ONLY 2-4 sentences (max 80 words) about why this specific '
-                "place fits me and answers to any questions in the ad – it is inserted into my "
-                "fixed template, so no greeting, no self-introduction, no sign-off."
-            )
-        else:
-            length = "Length: follow MESSAGE GUIDELINES."
+        register = REGISTER.get(kind, REGISTER["room"])
+        if self.template_mode:
+            return SYSTEM_TEMPLATE.format(city=self.city, language=language, register=register)
         return SYSTEM.format(
-            city=self.city, language=language, register=REGISTER.get(kind, REGISTER["room"]), length_rule=length
+            city=self.city, language=language, register=register, length_rule="Length: follow MESSAGE GUIDELINES."
         )
 
     async def _chat(self, system, user, want_json=True):
@@ -195,9 +266,13 @@ class LLM:
             except Exception:
                 return {}
 
-    def _wrap_template(self, l, lang, body, keyword):
-        tpl = (self.me.get("templates") or {}).get(f"{l.kind}_{lang}") or (self.me.get("templates") or {}).get(lang)
+    def _wrap_template(self, l, lang, body, keyword, keyword_at_start=False):
+        """My fixed text with the ad-specific part in {personal}. Placeholders: {greeting} {personal} {name}
+        {whatsapp}; anything else in the text stays exactly as written."""
+        kind = l.kind if l.kind in ("room", "studio") else "room"
+        tpl = self._template(kind, lang)
         if not tpl:
+            log.warning("template mode, but no me.templates.%s_%s: sending only the model's part", kind, lang)
             return body
         name = first_name(l.poster)
         greet = {
@@ -205,16 +280,37 @@ class LLM:
             ("en", "room"): f"Hi {name}," if name else "Hi everyone,",
             ("de", "studio"): f"Hallo {name}," if name else "Guten Tag,",
             ("en", "studio"): f"Hello {name}," if name else "Hello,",
-        }[(lang, l.kind if l.kind in ("room", "studio") else "room")]
-        msg = tpl.format(greeting=greet, personal=body.strip(), name=self.me["name"]).strip()
+        }[(lang, kind)]
+        body = body.strip()
+        first = ""
+        if keyword and keyword_at_start:  # the ad wants the code word first: its sentence opens the message
+            parts = re.split(r"(?<=[.!?])\s+", body)
+            hit = next((s for s in parts if keyword.lower() in s.lower()), "")
+            if hit:
+                first, body = hit, " ".join(s for s in parts if s is not hit)
+        fill = {"greeting": greet, "personal": body, "name": self.me["name"], "whatsapp": self.me.get("whatsapp", "")}
+        msg = tpl
+        for k, v in fill.items():
+            msg = msg.replace("{" + k + "}", str(v or ""))
+        msg = re.sub(r"[ \t]+\n", "\n", msg)
+        msg = re.sub(r"\n{3,}", "\n\n", msg).strip()  # an empty {personal} leaves no gap
+        if first and re.match(r"(hallo|hi|hey|servus|moin|grüß|liebe|dear|hello)\b", first, re.I):
+            msg = msg.replace(greet, first, 1)  # the code phrase is itself a greeting ("Servus Corps RP!")
+        elif first:
+            msg = f"{first}\n\n{msg}"
         if keyword and keyword.lower() not in msg.lower():
             msg = f"{keyword}\n\n{msg}"
         return msg
 
     async def evaluate(self, listing, lang: str, commute_text="") -> dict:
-        raw = await self._chat(
-            self._system(lang, listing.kind), self._profile() + "\n\n=== AD ===\n" + self._ad(listing, commute_text)
-        )
+        language = "German" if lang == "de" else "English"
+        user = self._profile()
+        if self.template_mode and (tpl := self._template(listing.kind, lang)):
+            user += f"\n\n=== MY FIXED TEXT (your part goes where {{personal}} is) ===\n{tpl}"
+        user += "\n\n=== AD ===\n" + self._ad(listing, commute_text)
+        if self.template_mode:
+            user += f'\n\nWrite "message" in {language}.'
+        raw = await self._chat(self._system(lang, listing.kind), user)
         d = self._json(raw)
         try:
             d["score"] = max(0, min(10, int(d.get("score", 0))))
@@ -227,15 +323,33 @@ class LLM:
         d["notes"] = [str(n).strip() for n in notes if str(n).strip()][:6]
         d["keyword_at_start"] = bool(d["keyword"]) and str(d.get("keyword_at_start")).lower() == "true"
         msg = (d.get("message") or "").strip()
+        if self.template_mode:  # the part can be short or even empty: the fixed text carries the message
+            if len(msg.split()) >= 5 and detect_language(msg) != lang:  # wrote in the ad's other language
+                msg = await self._chat(
+                    f"Translate into {language}. Keep names and any code word unchanged. Output only the translation.",
+                    msg,
+                    want_json=False,
+                )
+            msg = drop_bad_sentences(msg)
+            if (kw := d["keyword"]) and kw.lower() not in msg.lower():  # forgot the code word: one sentence for it
+                extra = await self._chat(
+                    f"Write one short, natural {language} sentence that uses the word or phrase given, unchanged, "
+                    "the way a person would mention it in a casual message. Output only the sentence.",
+                    kw,
+                    want_json=False,
+                )
+                msg = f"{msg} {extra.strip()}".strip()
+            d["message"] = self.with_contact(
+                self._wrap_template(listing, lang, msg, d["keyword"], d["keyword_at_start"])
+            )
+            return self._flag_scams(listing, d)
         if len(msg.split()) < 8:
             # it rejected the ad (e.g. day rentals only) and wrote nothing: that's a low score, not an error
             if d["score"] <= 3:
                 d["message"] = ""
                 return d
             raise ValueError(f"LLM returned no usable message: {raw[:300]}")
-        if self.me.get("mode", "full") == "template":
-            msg = self._wrap_template(listing, lang, msg, d["keyword"])
-        elif (kw := d["keyword"]) and kw.lower() not in msg.lower():  # model forgot the code word: one retry
+        if (kw := d["keyword"]) and kw.lower() not in msg.lower():  # model forgot the code word: one retry
             where = "as the very first word of the message" if d["keyword_at_start"] else "wherever it fits"
             msg = (
                 await self.rewrite(
@@ -250,6 +364,10 @@ class LLM:
             if kw.lower() not in msg.lower():
                 msg = f"{kw}\n\n{msg}"  # last resort: never lose the code word (the card flags it)
         d["message"] = self.with_contact(msg)
+        return self._flag_scams(listing, d)
+
+    @staticmethod
+    def _flag_scams(listing, d):
         flags = scam_signals(listing.title + " " + listing.description)
         if flags:
             d["red_flags"] = "; ".join(filter(None, [d["red_flags"]] + flags))
@@ -258,17 +376,28 @@ class LLM:
 
     async def rewrite(self, listing, lang: str, previous: str, feedback: str, commute_text="") -> str:
         language = "German" if lang == "de" else "English"
+        fresh = feedback.strip() in ("", ".")
+        if self.template_mode:  # my fixed text stays; only what I ask for changes
+            how = (
+                "Change only what WHAT TO CHANGE asks for and keep every other sentence word for word: most "
+                "of the draft is my own fixed text. Plain words, no praise of the flat. "
+            )
+            if fresh:
+                feedback = "Rephrase only the sentences about this specific ad; keep everything else word for word."
+        else:
+            how = ""
+            if fresh:
+                feedback = "Write a fresh, different version."
         system = (
             f"Rewrite a message answering a flat/WG ad. Write ONLY in {language}. "
-            f"{REGISTER.get(listing.kind, REGISTER['room'])} Use only facts from the profile; keep any "
+            f"{REGISTER.get(listing.kind, REGISTER['room'])} {how}Use only facts from the profile; keep any "
             "code word and my WhatsApp number from the previous draft. Output only the new message text, nothing else."
         )
         user = (
             self._profile()
             + "\n\n=== AD ===\n"
             + self._ad(listing, commute_text)
-            + f"\n\n=== PREVIOUS DRAFT ===\n{previous}\n\n=== WHAT TO CHANGE ===\n"
-            + (feedback if feedback.strip() not in ("", ".") else "Write a fresh, different version.")
+            + f"\n\n=== PREVIOUS DRAFT ===\n{previous}\n\n=== WHAT TO CHANGE ===\n{feedback}"
         )
         return self.with_contact(await self._chat(system, user, want_json=False))
 

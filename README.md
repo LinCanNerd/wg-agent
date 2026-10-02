@@ -30,7 +30,8 @@ the ad's language, and sends you a card in **Telegram**. **Nothing is ever sent 
   (same text, or same street, size and rent), and advertisers you've already written to.
 - **LLM drafting:** scores the ad 0–10, spots scam signals and code words ("start your message with
   *Banane*"), answers questions the ad asks, and writes the message in German or English: casual
-  "du" for WGs, polite "Sie" for studios. German drafts come with an English translation for you.
+  "du" for WGs, polite "Sie" for studios. By default it sends your own fixed text and only adds a
+  sentence about the ad. German drafts come with an English translation for you.
 - **Telegram approval:** photo album + card with commute, flatmates, score, warnings, notes and the
   draft. Buttons: `✅ Send` `❌ Skip` `✏️ Edit` `🔁 Rewrite` `🔗 Ad` `🗺 Map` `🚲 Route`.
 - **Safe sending:** goes straight to the contact form, refuses if you already wrote to that ad or
@@ -118,9 +119,14 @@ Everything lives in `config.yaml`; `config.example.yaml` documents every option.
 - **`commute.destinations`:** the places you travel to, with limits. `action: exclude` drops ads that
   are too far; `mark` only adds a warning.
 - **`me.mode`:**
-  - `full`: the model writes the whole message, following your guidelines.
-  - `template`: the model writes only 2–4 sentences about the ad, which go into your fixed text.
-  In both modes a code word found in the ad is always kept.
+  - `template` (what `config.example.yaml` uses): your own fixed text (`me.templates`, one per WG/studio and German/English)
+    is sent word for word. The model only fills in the greeting and one plain sentence about the ad,
+    plus answers to questions the ad asks and a code word if there is one. It sees your text so it
+    doesn't repeat it, and sentences where it invents where you live are dropped.
+  - `full`: the model writes the whole message, following `message_guidelines`. More varied, but it
+    tends to sound like an AI.
+  In both modes a code word found in the ad is always kept; a greeting-style one ("Servus Corps RP!")
+  replaces the greeting.
 - **Other cities:** set `city`, use that city's search URLs, and adjust `districts_exclude` and
   `commute.viewbox`.
 

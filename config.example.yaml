@@ -151,10 +151,14 @@ me:
   name: "Alex"                   # TODO: your first name (used to sign messages)
   whatsapp: ""                   # optional, e.g. "+49 151 23456789": added to every draft, checked digit by digit
   gender: m                      # m / w: skips WG ads that only want the other gender
-  mode: full                     # full = the model writes the whole message
-                                 # template = the model writes only 2-4 tailored sentences that go into
-                                 #            your fixed text below
-  templates:                     # only used in template mode
+  mode: template                 # template = your own fixed text below is sent word for word; the model
+                                 #            only fills in {greeting} and {personal}: one plain sentence
+                                 #            about the ad, answers to questions it asks, and a code word
+                                 #            if there is one. Sounds like you, not like an AI.
+                                 # full = the model writes the whole message, following message_guidelines
+  templates:                     # used in template mode: <room|studio>_<de|en>. Placeholders: {greeting}
+                                 # {personal} {name} {whatsapp}; everything else stays exactly as written.
+                                 # One line per paragraph: line breaks inside a paragraph are sent too.
     room_de: |
       {greeting}
 
@@ -162,8 +166,9 @@ me:
 
       {personal}
 
-      Ich bin offen, ordentlich und zuverlässig. Ich würde mich sehr über eine Besichtigung
-      oder einen Videocall freuen!
+      Ich bin offen, ordentlich und zuverlässig. In meiner Freizeit gehe ich klettern und fahre Rad, und ich spiele gern Brettspiele. Ich rauche nicht und habe keine Haustiere.
+
+      Ich kann gern bald zur Besichtigung vorbeikommen, ein Videocall geht auch.
 
       Viele Grüße
       {name}
@@ -174,9 +179,37 @@ me:
 
       {personal}
 
-      I'm open, tidy and reliable. I'd love to come by for a viewing or have a video call!
+      I'm open, tidy and reliable. In my free time I go climbing and cycling, and I like board games. I don't smoke and have no pets.
+
+      I can come by for a viewing soon, and a video call works too.
 
       Best,
+      {name}
+    studio_de: |
+      {greeting}
+
+      mein Name ist {name}, ich bin 27 und arbeite als Softwareentwickler in München, unbefristet.
+
+      {personal}
+
+      Ich suche eine Wohnung für mich allein. Ich rauche nicht, habe keine Haustiere und bin ein ordentlicher, zuverlässiger Mieter. Schufa-Auskunft und Einkommensnachweise schicke ich Ihnen gern.
+
+      Ich kann gern bald zur Besichtigung kommen, ein Videocall ist auch möglich.
+
+      Viele Grüße
+      {name}
+    studio_en: |
+      {greeting}
+
+      My name is {name}, I'm 27 and I work as a software developer in Munich, on a permanent contract.
+
+      {personal}
+
+      I'm looking for a flat for myself. I don't smoke, have no pets, and I'm a tidy, reliable tenant. I can send you a Schufa report and proof of income.
+
+      I can come for a viewing soon, and a video call is fine too.
+
+      Best regards,
       {name}
   # TODO: replace this example person with yourself.
   profile: |
