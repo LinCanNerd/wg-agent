@@ -212,28 +212,27 @@ price/size, WG vibe or studio quality, availability date, and who they are looki
 
 The part you write ("message"):
 - Write ONLY in {language}, even if the ad or my profile uses another language. {register}
-- One or two short, plain sentences (at most 30 words in total) with facts, the way a normal person
-  types a quick message:
-  - the way to my work, with the real minutes from the first COMMUTE line (bike or public transport,
-    whichever is shorter): "Von hier wäre ich mit der U-Bahn in 25 Minuten bei der Arbeit." / "From here
-    I'd be at work in 25 minutes by U-Bahn." Skip it if COMMUTE is unknown. Never mention the other
-    COMMUTE places.
-  - a second sentence ONLY if the ad itself mentions something that matches MY PROFILE, said as a plain
-    fact in your own words. For example, only if the ad says the WG is international: "Ich wohne gern mit
-    Leuten aus verschiedenen Ländern zusammen."; only if they cook together: "Ich koche auch gern für
-    andere mit."; only if they do sports: "Beim Volleyball wäre ich sofort dabei." If nothing in the ad
-    matches, write only the commute sentence.
+- One or two short, plain sentences (at most 30 words in total) that show I read THEIR ad: take one
+  concrete thing they wrote about themselves, the WG or who they're looking for, and say plainly how it
+  fits me, using a fact from MY PROFILE. Write it the way a normal person types a quick message. For
+  example, only if they say they cook together: "Ihr schreibt, dass ihr oft zusammen kocht, da bin ich
+  gern dabei."; only if the WG is international: "Mit Leuten aus verschiedenen Ländern zusammenzuwohnen
+  gefällt mir."; only if they play sports: "Beim Volleyball wäre ich sofort dabei." Use your own words.
+- If nothing in the ad connects to me, write nothing (empty string): my fixed text works on its own.
+- Don't write about my commute, my job or the location: they don't care how I get to work. Only if the
+  ad asks about it.
 - MY FIXED TEXT is shown below: never repeat anything it already says (my age, job, origin, hobbies,
-  cooking, smoking, pets, languages, viewing, contact). Add only what is new.
-- Use ONLY facts from MY PROFILE. Never invent anything (study subject, where I live now, dates). The
-  flat's location is not where I live: wrong "Da ich in der Altstadt wohne, ...", right "Von hier wäre
-  ich schnell bei der Arbeit in ...". If the ad asks something my profile doesn't answer, leave it out
-  (don't write that you can't answer) and say so in "notes".
+  cooking, smoking, pets, languages, moving in, viewing, contact). Add only what is new.
+- Use ONLY facts from MY PROFILE. Never invent anything (study subject, where I live now, dates), and
+  never claim likes or abilities it doesn't state (that I like cats, plants, hiking...). The flat's
+  location is not where I live: never write "Da ich in der Altstadt wohne, ...". If the ad asks
+  something my profile doesn't answer, leave it out (don't write that you can't answer) and say so in
+  "notes".
 - No praise and no opinions about the flat, the WG or the ad: no "super", "klasse", "toll", "cool",
   "perfekt", "wunderbar", "spannend", "gemütlich", "finde ich schön" (awesome, great, perfect, lovely,
   cozy, amazing). Never repeat their description back to them.
-- Never give my job or hobbies as the reason for something ("Da ich in der Robotik arbeite, passt die
-  Lage" makes no sense).
+- Never give my job as the reason for something ("Da ich in der Robotik arbeite, passt die Lage" makes no
+  sense).
 - If the ad asks applicants questions or to mention something (favourite dish, hobbies, why you...),
   add one short, casual sentence per question with the answer from MY PROFILE, unless my fixed text
   already answers it.
