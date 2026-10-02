@@ -388,15 +388,28 @@ def card_text(l: Listing, r, meta, with_translation=True):
         sentence = next((s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", draft) if kw.lower() in s.lower()), "")
         if not sentence:
             status = "⛔ MISSING from the draft"
+        elif meta.get("keyword_subject"):  # no subject line on the sites: alone on the first line instead
+            status = (
+                "✅ as the first line (instead of a subject)"
+                if draft.split("\n")[0].strip() == kw
+                else ("⚠️ should be alone on the first line")
+            )
         elif at_start and not draft.lower().startswith(kw.lower()):
             status = "⚠️ not the first word"
         elif sentence.lower().strip(" .,!?") == kw.lower():
             status = "⚠️ stands alone, not in a sentence"
         else:
             status = "✅"
+        if not meta.get("traps") and status.startswith("✅"):  # the model found one, the text search didn't
+            status += " (not sure: the ad has no clear request to write it)"
         lines.append(f"🔑 Code word <b>{e(kw)}</b> ({'must be the first word' if at_start else 'anywhere'}) {status}")
         if sentence:
             lines.append(f"      ↳ <i>{e(sentence[:300])}</i>")
+    if traps := meta.get("traps"):  # straight from the ad text, so a test the model overlooked still shows
+        lines.append(
+            "🪤 The ad says:" if kw else "🪤 Possible test in the ad, and the model found no code word. Check:"
+        )
+        lines += [f"      <i>{e(t[:200])}</i>" for t in traps]
     if (phone := CFG["me"].get("whatsapp")) and not has_number(r["draft"] or "", phone):
         lines.append("⚠️ Your WhatsApp number is missing from the draft (or a digit is wrong)")
     if meta.get("questions"):
@@ -614,7 +627,8 @@ async def process(bot, l: Listing, force=False):
         return
     if out.get("commute_ok") is False and res:
         warnings.append("the model thinks the commute isn't feasible")
-    meta = {k: out.get(k) for k in ("reasons", "red_flags", "keyword", "keyword_at_start", "questions", "notes")}
+    keys = ("reasons", "red_flags", "keyword", "keyword_at_start", "keyword_subject", "traps", "questions", "notes")
+    meta = {k: out.get(k) for k in keys}
     meta["warnings"] = warnings
     DB_.update(l.id, lang=lang, score=out["score"], draft=out["message"], note=json.dumps(meta))
     min_score = search_cfg(l).get("min_score", CFG["search"].get("min_score", 0))

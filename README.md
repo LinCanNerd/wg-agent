@@ -32,6 +32,11 @@ the ad's language, and sends you a card in **Telegram**. **Nothing is ever sent 
   *Banane*"), answers questions the ad asks, and writes the message in German or English: casual
   "du" for WGs, polite "Sie" for studios. By default it sends your own fixed text and only adds a
   sentence about the ad. German drafts come with an English translation for you.
+- **Trap check:** a plain text search (not the model) finds tests hidden in the ad ("schreib das Wort
+  *Brezel* in deine Nachricht", "write X in the subject line") and shows them on the card, so a test
+  the model overlooks still reaches you. The code word goes into a natural sentence; if it must come
+  first, the message really starts with it, a greeting-style one ("Moin Moin") becomes the greeting, and
+  a subject-line one goes alone on the first line. The card checks all of this again before you send.
 - **Telegram approval:** photo album + card with commute, flatmates, score, warnings, notes and the
   draft. Buttons: `✅ Send` `❌ Skip` `✏️ Edit` `🔁 Rewrite` `🔗 Ad` `🗺 Map` `🚲 Route`.
 - **Safe sending:** goes straight to the contact form, refuses if you already wrote to that ad or

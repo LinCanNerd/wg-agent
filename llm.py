@@ -30,6 +30,76 @@ SCAM_PATTERNS = {
 }
 
 
+# Tests hidden in ads ("schreib das Wort Brezel in deine Nachricht"). Found by plain text search, so a
+# model that overlooks one can't hide it: the snippets go to the model and onto the card.
+QUOTE = "\"„“”'‚‘’»«"
+TRAP_RE = re.compile(  # on its own enough to show the sentence
+    r"stichwort|codewort|code-wort|kennwort|losungswort|zauberwort|geheimwort|schlüsselwort|passwort|"
+    r"code ?word|keyword|password|secret word|magic word|safe ?word|"
+    r"betreff|subject line|bis zum (ende|schluss) gelesen|(ganz|alles|vollständig) gelesen|"
+    r"so we know you|to show (us )?(that )?you (have )?read|read (the|this) (whole|entire|full) ad|"
+    r"(beginne?|fang|starte?|schreib|nenn|erwähn|verwende|benutz|einbau|mention|include|begin|start|"
+    r"write|put|use)\w*\b[^.!?\n]{0,80}\b(wort|word|satz|sentence|phrase)\b|"
+    r"(confirm|bestätig)\w*[^.!?\n]{0,60}\b(message|nachricht|anfrage)|"
+    r"\b(message|nachricht|anfrage)\b[^.!?\n]{0,60}(confirm|bestätig)",
+    re.I,
+)
+# "start your message with 'Banane'": a message instruction counts only with a quoted word in it,
+# so the everyday "schreib uns eine Nachricht" doesn't
+MESSAGE_RE = re.compile(
+    r"(beginne?|fang|starte?|schreib|nenn|erwähn|verwende|mention|include|begin|start|write|put|use)\w*\b"
+    r"[^.!?\n]{0,80}\b(nachricht|message|anfrage|mail)\b",
+    re.I,
+)
+HEADING_RE = re.compile(r"\s*(stichwort|keyword)\s+[\w-]+(\s+[\w-]+)?\s*:", re.I)
+QUOTED_RE = re.compile(rf"[{QUOTE}]([^{QUOTE}\n]{{1,40}}?)[{QUOTE}]")
+
+
+def find_traps(text: str) -> list[str]:
+    """Sentences of the ad that look like a test or an instruction for the message (at most 4)."""
+    out = []
+    for sent in re.split(r"(?<=[.!?])\s+|\n+", text or ""):
+        sent = sent.strip()
+        hit = TRAP_RE.search(sent) or (MESSAGE_RE.search(sent) and QUOTED_RE.search(sent))
+        if HEADING_RE.match(sent) and not re.search(
+            r"nachricht|message|anfrage|schreib|beginn|write|start", sent, re.I
+        ):
+            hit = None  # "Stichwort Nachhaltigkeit: wir trennen Müll" is a heading, not a test
+        if 8 < len(sent) < 400 and hit and sent not in out:
+            out.append(sent)
+    return out[:4]
+
+
+GREETING_RE = re.compile(r"(hallo|hi|hey|servus|moin|grüß|grüezi|liebe|guten (tag|morgen|abend)|dear|hello)\b", re.I)
+
+
+def subject_line(kw: str, traps: list[str]) -> bool:
+    """The ad wants the code word in the subject line. WG-Gesucht has none, so it goes on the first line alone."""
+    return bool(kw) and any(re.search(r"betreff|subject", t, re.I) and kw.lower() in t.lower() for t in traps)
+
+
+def strip_code_sentences(text: str, kw: str) -> str:
+    """Drop the sentences with the code word; after a greeting with a comma ("Moin Moin, von hier ...")
+    the rest of the sentence stays."""
+    kept = []
+    for x in re.split(r"(?<=[.!?])\s+", text.strip()):
+        if kw.lower() not in x.lower():
+            kept.append(x)
+            continue
+        rest = re.sub(rf"^\s*{re.escape(kw)}\s*,\s*", "", x, flags=re.I)
+        if rest != x and kw.lower() not in rest.lower() and len(rest.split()) >= 4:
+            kept.append(rest[:1].upper() + rest[1:])
+    return " ".join(kept)
+
+
+def clean_keyword(kw: str) -> str:
+    return (kw or "").strip().strip(QUOTE + " ").strip()
+
+
+def starts_with(text: str, kw: str) -> bool:
+    return bool(kw) and re.sub(rf"^[\s{QUOTE}*]+", "", text).lower().startswith(kw.lower())
+
+
 def scam_signals(text: str) -> list[str]:
     low = text.lower()
     return [why for pat, why in SCAM_PATTERNS.items() if re.search(pat, low)]
@@ -88,8 +158,12 @@ Message rules:
   "mention the word...", "schreib 'Banane' in die Betreffzeile". If there is one, put it in "keyword"
   and work it into a natural, friendly sentence that makes sense with the word (e.g. Banane ->
   "Banane im Müsli ist übrigens mein Frühstücks-Geheimtipp."), never as a bare word on its own.
-  If the ad says the message must START with it, that sentence opens the message with the code word
-  as its very first word, on its own line before the greeting; otherwise put it wherever it fits best.
+  If the ad says the message must START with it (or wants it in the subject line: there is no subject
+  line, so that means the start), that sentence opens the message with the code word as its very first
+  word, on its own line before the greeting; otherwise put it wherever it fits best. Check every line
+  under POSSIBLE TESTS IN THE AD. Only an explicit request to write or start with a word counts ("Stichwort
+  Nachhaltigkeit: ..." as a heading is not one). The sentence must make sense on its own: never say
+  you're writing the word because they asked.
 - If the ad asks applicants questions (e.g. "tell us your favourite dish", "what would you bring to
   a WG brunch?"), answer each one briefly. Harmless preferences may be made up, identity facts never.
 - Start with something specific from the ad, not "I saw your ad" / "ich habe eure Anzeige gesehen".
@@ -141,8 +215,13 @@ The part you write ("message"):
   add one short, casual sentence per question with the answer from MY PROFILE, unless my fixed text
   already answers it.
 - If the ad has a code word / Stichwort / instruction like "start your message with...", "mention the
-  word...": put it in "keyword" and use the word in one short, natural sentence here (e.g. Banane ->
-  "Banane im Müsli ist übrigens mein Frühstück."), never as a bare word.
+  word...", "write X in the subject line": put the exact word or phrase (no quotes) in "keyword" and use
+  it in one short, natural sentence here (e.g. Banane -> "Banane im Müsli ist übrigens mein Frühstück."),
+  never as a bare word. If it must come first (or in the subject line: there is none, so that means
+  first), that sentence must BEGIN with the code word. Check every line under POSSIBLE TESTS IN THE AD.
+  Only an explicit request to write or start with a word counts ("Stichwort Nachhaltigkeit: ..." as a
+  heading is not one). The sentence must make sense on its own: never say you're writing the word
+  because they asked.
 - Nothing else: no greeting, no introduction of myself, no German level, no viewing or contact
   details, no sign-off. My fixed text already has all of that.
 
@@ -266,7 +345,7 @@ class LLM:
             except Exception:
                 return {}
 
-    def _wrap_template(self, l, lang, body, keyword, keyword_at_start=False):
+    def _wrap_template(self, l, lang, body, keyword, keyword_at_start=False, subject=False):
         """My fixed text with the ad-specific part in {personal}. Placeholders: {greeting} {personal} {name}
         {whatsapp}; anything else in the text stays exactly as written."""
         kind = l.kind if l.kind in ("room", "studio") else "room"
@@ -283,7 +362,11 @@ class LLM:
         }[(lang, kind)]
         body = body.strip()
         first = ""
-        if keyword and keyword_at_start:  # the ad wants the code word first: its sentence opens the message
+        if keyword and subject:  # "write it in the subject line": alone on the first line, like a subject
+            first = keyword
+        elif keyword and keyword_at_start and GREETING_RE.match(keyword):  # "Servus Corps RP!" is the greeting
+            greet = keyword if keyword[-1] in ",!?." else f"{keyword} {name}," if name else f"{keyword},"
+        elif keyword and keyword_at_start:  # the ad wants the code word first: its sentence opens the message
             parts = re.split(r"(?<=[.!?])\s+", body)
             hit = next((s for s in parts if keyword.lower() in s.lower()), "")
             if hit:
@@ -294,9 +377,9 @@ class LLM:
             msg = msg.replace("{" + k + "}", str(v or ""))
         msg = re.sub(r"[ \t]+\n", "\n", msg)
         msg = re.sub(r"\n{3,}", "\n\n", msg).strip()  # an empty {personal} leaves no gap
-        if first and re.match(r"(hallo|hi|hey|servus|moin|grüß|liebe|dear|hello)\b", first, re.I):
-            msg = msg.replace(greet, first, 1)  # the code phrase is itself a greeting ("Servus Corps RP!")
-        elif first:
+        if greet[-1] in "!.?":  # "Servus Corps RP!" ends a sentence: what follows starts with a capital
+            msg = re.sub(rf"({re.escape(greet)}\s+)(\w)", lambda m: m.group(1) + m.group(2).upper(), msg, count=1)
+        if first:
             msg = f"{first}\n\n{msg}"
         if keyword and keyword.lower() not in msg.lower():
             msg = f"{keyword}\n\n{msg}"
@@ -308,6 +391,10 @@ class LLM:
         if self.template_mode and (tpl := self._template(listing.kind, lang)):
             user += f"\n\n=== MY FIXED TEXT (your part goes where {{personal}} is) ===\n{tpl}"
         user += "\n\n=== AD ===\n" + self._ad(listing, commute_text)
+        if traps := find_traps(f"{listing.title}\n{listing.description}"):
+            user += "\n\n=== POSSIBLE TESTS IN THE AD (found by a text search; check each) ===\n" + "\n".join(
+                f"- {t}" for t in traps
+            )
         if self.template_mode:
             user += f'\n\nWrite "message" in {language}.'
         raw = await self._chat(self._system(lang, listing.kind), user)
@@ -318,10 +405,18 @@ class LLM:
             d["score"] = 0
         for k in ("reasons", "red_flags", "keyword", "questions"):
             d[k] = str(d.get(k) or "").strip()
+        d["keyword"] = clean_keyword(d["keyword"])
+        d["traps"] = find_traps(f"{listing.title}\n{listing.description}")
         notes = d.get("notes") or []
         notes = [notes] if isinstance(notes, str) else notes
         d["notes"] = [str(n).strip() for n in notes if str(n).strip()][:6]
         d["keyword_at_start"] = bool(d["keyword"]) and str(d.get("keyword_at_start")).lower() == "true"
+        kw = d["keyword"]
+        d["keyword_subject"] = subject_line(kw, d["traps"])
+        d["keyword_at_start"] = d["keyword_at_start"] or d["keyword_subject"]
+        at_start = d["keyword_at_start"]
+        # ways of putting it first that need no sentence: alone as a "subject" line, or as the greeting
+        plain_start = d["keyword_subject"] or (at_start and GREETING_RE.match(kw))
         msg = (d.get("message") or "").strip()
         if self.template_mode:  # the part can be short or even empty: the fixed text carries the message
             if len(msg.split()) >= 5 and detect_language(msg) != lang:  # wrote in the ad's other language
@@ -331,16 +426,17 @@ class LLM:
                     want_json=False,
                 )
             msg = drop_bad_sentences(msg)
-            if (kw := d["keyword"]) and kw.lower() not in msg.lower():  # forgot the code word: one sentence for it
-                extra = await self._chat(
-                    f"Write one short, natural {language} sentence that uses the word or phrase given, unchanged, "
-                    "the way a person would mention it in a casual message. Output only the sentence.",
-                    kw,
-                    want_json=False,
-                )
-                msg = f"{msg} {extra.strip()}".strip()
+            if kw and plain_start:  # the template puts it first itself: drop it from the part
+                msg = strip_code_sentences(msg, kw)
+            elif kw:
+                sentences = re.split(r"(?<=[.!?])\s+", msg)
+                hit = next((x for x in sentences if kw.lower() in x.lower()), "")
+                if not hit or (at_start and not starts_with(hit, kw)):  # missing, or not at the very front
+                    new = await self._code_sentence(kw, language, at_start)
+                    sentences = [x for x in sentences if x and x is not hit]
+                    msg = " ".join([new, *sentences] if at_start else [*sentences, new])
             d["message"] = self.with_contact(
-                self._wrap_template(listing, lang, msg, d["keyword"], d["keyword_at_start"])
+                self._wrap_template(listing, lang, msg, kw, at_start, d["keyword_subject"])
             )
             return self._flag_scams(listing, d)
         if len(msg.split()) < 8:
@@ -363,8 +459,33 @@ class LLM:
             ).strip()
             if kw.lower() not in msg.lower():
                 msg = f"{kw}\n\n{msg}"  # last resort: never lose the code word (the card flags it)
+        if kw and d["keyword_subject"] and msg.split("\n")[0].strip() != kw:
+            msg = f"{kw}\n\n{msg}"
+        elif kw and at_start and GREETING_RE.match(kw) and not starts_with(msg, kw):  # it replaces the greeting
+            lines = msg.split("\n")
+            msg = "\n".join([kw if kw[-1] in ",!?." else f"{kw},", *lines[1:]])
+        elif kw and at_start and not starts_with(msg, kw):
+            msg = f"{await self._code_sentence(kw, language, True)}\n\n{msg}"
         d["message"] = self.with_contact(msg)
         return self._flag_scams(listing, d)
+
+    async def _code_sentence(self, kw, language, at_start) -> str:
+        """One natural sentence with the code word (beginning with it if it must come first). If the model
+        can't manage that, the code word alone: never lose it (the card flags a bare word)."""
+        where = "BEGINS with exactly these words" if at_start else "uses these words unchanged"
+        try:
+            out = await self._chat(
+                f"Write one short, natural, casual {language} sentence that {where}. It must make sense on its "
+                "own; don't say you are writing the word because someone asked. Output only the sentence.",
+                kw,
+                want_json=False,
+            )
+            out = out.strip().strip('"').splitlines()[0].strip() if out.strip() else ""
+        except Exception:
+            log.exception("code word sentence failed")
+            out = ""
+        ok = starts_with(out, kw) if at_start else kw.lower() in out.lower()
+        return out if ok and len(out) < 200 else kw
 
     @staticmethod
     def _flag_scams(listing, d):
