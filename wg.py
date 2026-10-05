@@ -241,6 +241,15 @@ def apply_detail(l: Listing, d: dict, html: str) -> Listing:
     return l
 
 
+def latest_is_mine(conv: dict) -> bool:
+    """The inbox preview starts the newest message with "Ich:" (English site: "Me:"/"You:") when I wrote it,
+    e.g. "Ji Li (, 48) Möbliertes Zimmer ... Ich: thanks, see you at 6"."""
+    text, title = conv.get("text") or "", conv.get("title") or ""
+    if title and title in text:
+        return bool(re.match(r"\s*(Ich|Me|You):\s", text.split(title, 1)[1]))
+    return bool(re.search(r"\s(Ich|Me):\s", text))
+
+
 async def shows_logged_out(page) -> bool:
     if "login" in page.url.lower() or await page.locator("#login_email_username:visible").count():
         return True
@@ -411,6 +420,7 @@ class WGGesucht(Site):
             convs = await page.evaluate(INBOX_JS)
         for c in convs:
             c["key"] = "conv:" + c["href"].split("nachrichten-id=")[-1].split("&")[0]
+            c["mine"] = latest_is_mine(c)  # my own reply typed on the site is not a reply from them
         return convs
 
     async def conversation_ad_id(self, href) -> str | None:
