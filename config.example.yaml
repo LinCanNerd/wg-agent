@@ -65,7 +65,7 @@ poll:
   skip_existing_on_start: true  # don't open every ad that's already online on the first run
 
 search:
-  # One entry per search; the URL decides the site (WG-Gesucht or Kleinanzeigen). The agent adds
+  # One entry per search; the URL decides the site (WG-Gesucht, Kleinanzeigen or ImmoScout24). The agent adds
   # newest-first sorting, max rent and the site's other filters to the URL automatically, so the site
   # does most of the filtering. You can also paste a search URL from the site with your own filters.
   # For another city, open its search page and copy the URL (WG-Gesucht: the number after the city
@@ -96,6 +96,16 @@ search:
     #   max_rent: 1100
     #   min_score: 8
     #   every_n_polls: 4
+    #   max_ad_age_hours: 72
+    # ImmoScout24 (optional): flats (.../wohnung-mieten) and WG rooms (.../wg-zimmer; only private ads are
+    # kept, the rest is mostly co-living companies). Paste a search URL from the website with your own
+    # filters (rooms, size, balcony, radius...). The agent reads ImmoScout24 through its app's API and can't
+    # send there: you send from the app and tap "📤 I sent it" on the card. No --login needed.
+    # - kind: studio                # numberofrooms=-1.5 = up to 1.5 rooms
+    #   url: "https://www.immobilienscout24.de/Suche/de/bayern/muenchen/wohnung-mieten?numberofrooms=-1.5"
+    #   max_rent: 1100
+    #   min_score: 8
+    #   every_n_polls: 2
     #   max_ad_age_hours: 72
 
   # Extra hard filters applied by the agent (leave empty / 0 to disable)
@@ -144,6 +154,10 @@ sites:              # per-site settings (all optional)
     dry_run: true   # overrides send.dry_run there; sending on Kleinanzeigen stays a dry run until you set false
     # max_pages_per_hour: 40      # its own page budget; defaults to the poll: values
     # max_pages_per_day: 650
+  immoscout:
+    plus: false     # true if you have ImmoScout24 Plus. Many new private ads take messages only from Plus
+                    # members for their first days; without Plus the card says until when (🔒).
+    # user_agent: "ImmoScout_27.12_26.2_._"   # the app's; change it only if the API stops answering
 
 # Everything below is about you. The model only uses facts written here, so be complete and honest:
 # if an ad asks something your profile doesn't answer (smoker? pets?), the model may guess.

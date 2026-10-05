@@ -1,0 +1,27 @@
+# systemd user unit template: one agent per person, each in its own folder with its own config.yaml
+# (profile, templates, searches, Telegram bot). The folder also holds that person's database, spreadsheet,
+# screenshots and browser login. Install:
+#   mkdir -p ~/wg-agent-people/anna && cp config.example.yaml ~/wg-agent-people/anna/config.yaml  # fill it in
+#   cp wg-agent@.service ~/.config/systemd/user/ && systemctl --user daemon-reload
+#   systemctl --user enable --now wg-agent@anna
+# %i is the folder name, %h your home directory; change the paths if the repo isn't in ~/wg-agent.
+[Unit]
+Description=Flat agent for %i
+After=network-online.target
+Wants=network-online.target
+# If Ollama also runs as a user unit, start it first:
+# After=network-online.target ollama.service
+# Wants=ollama.service
+
+[Service]
+WorkingDirectory=%h/wg-agent-people/%i
+ExecStart=%h/wg-agent/.venv/bin/python %h/wg-agent/bot.py
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=30
+# stop only the bot: it saves the browser session, then closes its own Chromium
+KillMode=mixed
+TimeoutStopSec=120
+
+[Install]
+WantedBy=default.target

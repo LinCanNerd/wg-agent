@@ -1,4 +1,4 @@
-"""Flat-ad watcher (WG-Gesucht, Kleinanzeigen) + Telegram approval bot.
+"""Flat-ad watcher (WG-Gesucht, Kleinanzeigen, ImmoScout24) + Telegram approval bot.
 
 Usage:
     python bot.py --login             # once: log in to every site you search, in a visible browser
@@ -27,9 +27,10 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 
 from commute import Commute
 from guard import BudgetExceeded, CoolingDown, RateGuard
+from immoscout import ImmoScout
 from kleinanzeigen import Kleinanzeigen
 from llm import LLM, detect_language, first_name, has_number
-from sites import Blocked, Browser, Listing, LoggedOut, Site, interactive_login
+from sites import Blocked, Browser, Listing, LoggedOut, Site, interactive_login, is_commercial
 from tracker import looks_like_mine, match_conversation, write_excel
 from wg import WGGesucht
 
@@ -38,7 +39,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("agent")
 
 CFG: dict = {}
-SITE_TYPES = (WGGesucht, Kleinanzeigen)
+SITE_TYPES = (WGGesucht, Kleinanzeigen, ImmoScout)
 SITES: dict[str, Site] = {}  # every supported site; only the ones with a search are polled
 
 
@@ -281,6 +282,8 @@ def hard_filter(l: Listing, extra_text="") -> str | None:
         return f"old ad ({l.online})"
     if l.exchange:
         return "Tauschangebot"
+    if is_commercial(l.poster):  # names known only from the ad page (ImmoScout search results have none)
+        return f"commercial provider ({l.poster})"
     hay = f"{l.title} {l.card_text} {extra_text}".lower()
     for kw in s.get("keywords_exclude") or []:
         if kw.lower() in hay:
@@ -341,12 +344,19 @@ def links_keyboard(l: Listing):
     return InlineKeyboardMarkup([link_buttons(l)])
 
 
+def by_hand(l: Listing) -> bool:
+    """A site the agent can't send on (ImmoScout24): you send in its app and tap "I sent it"."""
+    return l.site in SITES and SITES[l.site].send_by_hand
+
+
 def keyboard(lid, l: Listing | None = None):
+    send = (
+        InlineKeyboardButton("📤 I sent it", callback_data=f"sent:{lid}")
+        if l and by_hand(l)
+        else InlineKeyboardButton("✅ Send", callback_data=f"send:{lid}")
+    )
     rows = [
-        [
-            InlineKeyboardButton("✅ Send", callback_data=f"send:{lid}"),
-            InlineKeyboardButton("❌ Skip", callback_data=f"skip:{lid}"),
-        ],
+        [send, InlineKeyboardButton("❌ Skip", callback_data=f"skip:{lid}")],
         [
             InlineKeyboardButton("✏️ Edit", callback_data=f"edit:{lid}"),
             InlineKeyboardButton("🔁 Rewrite", callback_data=f"rewrite:{lid}"),
@@ -385,6 +395,8 @@ def card_text(l: Listing, r, meta, with_translation=True):
         lines.append(f"🧭 {e(l.commute_text)}")
     if l.applicants is not None:
         lines.append(f"📨 {l.applicants} applicants so far")
+    if l.contact_note:
+        lines.append(f"🔒 {e(l.contact_note)}")
     if r["score"] is not None:
         lines.append(f"⭐ {r['score']}/10 — {e(meta.get('reasons') or '')}")
     for w in meta.get("warnings") or []:
@@ -426,6 +438,11 @@ def card_text(l: Listing, r, meta, with_translation=True):
     if meta.get("notes"):
         lines.append("\n<b>Notes:</b>\n" + "\n".join(f"📝 {e(n)}" for n in meta["notes"]))
     draft = (r["draft"] or "").strip() or "(no draft: the model rejected this ad. Use 🔁 Rewrite to get one anyway)"
+    if by_hand(l):
+        lines.append(
+            f"\n✍️ <b>Send this one yourself:</b> tap the draft to copy it, open the ad with 🔗 "
+            f"{SITES[l.site].label}, write to the advertiser there, then tap 📤 I sent it."
+        )
     lines.append(f"\n<b>Draft:</b>\n<pre>{e(draft[:3000])}</pre>")
     if with_translation and meta.get("translation"):
         lines.append(
@@ -520,6 +537,7 @@ FILTER_REASONS = [  # how hard_filter / commute notes start -> words for the dai
     (r"^free from", "free too late"),
     (r"^only ", "sublet too short"),
     (r"^too far from", "too far from work"),
+    (r"^commercial", "commercial provider"),
 ]
 
 
@@ -802,7 +820,7 @@ async def check_replies(bot):
         return
     for site in SITES.values():
         sent = DB_.sent_rows(site.name)
-        if not sent or site.guard.cooling_left():
+        if not sent or site.send_by_hand or site.guard.cooling_left():
             continue
         try:
             await check_site_replies(bot, site, sent)
@@ -889,6 +907,21 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         DB_.update(lid, status="skipped")
         await q.answer("Skipped")
         await q.edit_message_reply_markup(links_keyboard(l))
+    elif action == "sent":  # sent by hand in the site's app
+        if r["status"] in ("sent", "replied", "already"):
+            await q.answer("Already logged")
+            return
+        DB_.update(lid, status="sent", sent_at=time.time(), poster_id=l.poster_id or None)
+        await q.answer("Logged as sent")
+        await q.edit_message_reply_markup(links_keyboard(l))
+        try:
+            write_excel(DB_.c, EXCEL)
+        except Exception:
+            log.exception("excel export failed")
+        await q.message.reply_text(
+            f"📤 Logged in the applications sheet (/excel). I can't read your {SITES[l.site].label} inbox, "
+            "so replies there won't show up here."
+        )
     elif action in ("edit", "rewrite"):
         await q.answer()
         ctx.user_data["pending"] = (action, lid)
@@ -1003,7 +1036,10 @@ async def cmd_summary(update: Update, ctx):
 
 async def cmd_status(update: Update, ctx):
     st = ctx.bot_data
-    sites = "\n".join(f"{s.label}: {s.guard.status()} · dry run: {site_dry_run(s)}" for s in active_sites())
+    sites = "\n".join(
+        f"{s.label}: {s.guard.status()} · " + ("you send by hand" if s.send_by_hand else f"dry run: {site_dry_run(s)}")
+        for s in active_sites()
+    )
     await update.message.reply_text(
         f"{'⏸ paused' if st['paused'] else '▶️ running'}\n"
         f"Last poll: {st.get('last_poll', '–')} ({st.get('counts', {})} ads on page)\n"
@@ -1036,6 +1072,9 @@ async def login_lines() -> tuple[list[str], bool]:
     """One line per searched site (1 page load each), and whether all of them are logged in."""
     lines, all_ok = [], True
     for s in active_sites():
+        if s.send_by_hand:
+            lines.append(f"ℹ️ {s.label}: no login needed (you send from its app)")
+            continue
         try:
             ok = await s.is_logged_in()
             lines.append(
@@ -1075,8 +1114,7 @@ async def cmd_test(update: Update, ctx):
 
 # ---------------- main ----------------
 async def post_init(app: Application):
-    await BROWSER.start()
-    await COMMUTE_.setup()
+    await COMMUTE_.setup()  # Chromium starts on first use (the login check below, for the browser sites)
     app.bot_data.update(
         paused=False, fails={}, n=0, counts={}, zeros={}, seeded={}, budget_warned={}, poll_lock=asyncio.Lock()
     )
@@ -1129,15 +1167,26 @@ def main():
     DB_ = DB()
     if a.login:
         setup_sites(headless=False, block_resources=False)
-        sites = active_sites() if a.login == "all" else [SITES[a.login]] if a.login in SITES else []
+        browser_sites = {n: s for n, s in SITES.items() if not s.send_by_hand}
+        if a.login in SITES and SITES[a.login].send_by_hand:
+            raise SystemExit(f"{SITES[a.login].label} needs no login here: you send from its app.")
+        sites = (
+            [s for s in active_sites() if not s.send_by_hand]
+            if a.login == "all"
+            else [browser_sites[a.login]]
+            if a.login in browser_sites
+            else []
+        )
         if not sites:
-            raise SystemExit(f"Unknown site {a.login!r}. Choose from: {', '.join(SITES)}")
+            if a.login == "all":
+                raise SystemExit("None of your searches is on a site that needs a login.")
+            raise SystemExit(f"Unknown site {a.login!r}. Choose from: {', '.join(browser_sites)}")
         asyncio.run(interactive_login(BROWSER, sites))  # its page loads count against the budgets too
         return
 
     setup_sites(CFG["poll"].get("headless", True), CFG["poll"].get("block_resources", True))
     for sc in CFG["search"]["searches"]:
-        site_for_url(sc["url"])  # fail now on a search URL of an unsupported site
+        site_for_url(sc["url"]).check_search_url(sc["url"])  # fail now on a search URL a site can't use
     city = CFG.get("city", "München")
     LLM_ = LLM(CFG["llm"], CFG["me"], city)
     COMMUTE_ = Commute(CFG.get("commute"), DB_.kv_get, DB_.kv_set, city)

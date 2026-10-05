@@ -1,5 +1,6 @@
 """What every site has in common: the Listing record, one shared Chromium for all sites, and the Site
-base class with the page-load helpers. Each site (wg.py, kleinanzeigen.py) adds its own URLs and selectors.
+base class with the page-load helpers. Each site (wg.py, kleinanzeigen.py, immoscout.py) adds its own URLs
+and selectors.
 """
 
 import asyncio
@@ -42,7 +43,9 @@ COMMERCIAL_POSTERS = (
     "mr lodge",
     "miethelden",
 )
-SITE_LABELS = {"wg-gesucht": "WG-Gesucht", "kleinanzeigen": "Kleinanzeigen"}
+SITE_LABELS = {"wg-gesucht": "WG-Gesucht", "kleinanzeigen": "Kleinanzeigen", "immoscout": "ImmoScout24"}
+EXCHANGE_RE = re.compile(r"tauschangebot|wohnungstausch|tauschwohnung|zimmertausch", re.I)
+WG_TITLE_RE = re.compile(r"\bwg\b|wg-?zimmer|mitbewohner|zimmer in (einer|meiner|unserer)", re.I)
 
 
 class Blocked(Exception):
@@ -85,6 +88,7 @@ class Listing:
     member_since: str = ""
     send_url: str = ""
     exchange: bool = False  # Tauschangebot
+    contact_note: str = ""  # who may write, e.g. "Only ImmoScout Plus members can write until Fri 09.10. 12:44"
     commute: dict = field(default_factory=dict)
     commute_text: str = ""
 
@@ -98,6 +102,11 @@ class Listing:
 
 def is_commercial(poster: str, title: str = "") -> bool:
     return any(c in f"{poster} {title}".lower() for c in COMMERCIAL_POSTERS)
+
+
+def guess_kind(title, kind):
+    """People post WG rooms in the flats category too: a title about a WG makes it a room."""
+    return "room" if kind == "studio" and WG_TITLE_RE.search(title or "") else kind
 
 
 class Browser:
@@ -195,6 +204,7 @@ class Site:
     domain = ""  # e.g. "wg-gesucht.de"
     login_url = ""  # where --login opens
     send_verified = True  # False: sending is a dry run unless sites.<name>.dry_run says otherwise
+    send_by_hand = False  # True: the agent only reads the site; you send in its app and tap "I sent it"
 
     def __init__(self, browser: Browser, guard=None, cfg: dict | None = None):
         self.browser = browser
@@ -220,6 +230,9 @@ class Site:
     def prepare_search_url(self, url: str, max_rent=None, min_size=None) -> str:
         """Let the site do the filtering and sort newest first."""
         return url
+
+    def check_search_url(self, url: str):
+        """Raise ValueError if this site can't search with that URL (checked at startup)."""
 
     async def search(self, url: str, kind="room") -> list[Listing]:
         raise NotImplementedError
@@ -252,6 +265,8 @@ class Site:
 
     @asynccontextmanager
     async def _page(self):
+        if self.ctx is None:  # Chromium starts on first use: an ImmoScout-only setup never needs it
+            await self.browser.start()
         page = await self.ctx.new_page()
         try:
             yield page

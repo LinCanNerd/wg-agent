@@ -1,8 +1,9 @@
 # wg-agent: notes for Claude Code
 
-Flat-hunting agent. It polls WG-Gesucht and Kleinanzeigen searches, a local LLM scores each ad and drafts a
-message in the ad's language (German or English), and the user approves every message in Telegram
-before it's sent. Nothing is ever sent without the user tapping ✅. See README.md for the user-facing docs.
+Flat-hunting agent. It polls WG-Gesucht, Kleinanzeigen and ImmoScout24 searches, a local LLM scores each ad and
+drafts a message in the ad's language (German or English), and the user approves every message in Telegram
+before it's sent. Nothing is ever sent without the user tapping ✅ (on ImmoScout24 the agent never sends: the
+user sends from the app and taps 📤 I sent it). See README.md for the user-facing docs.
 
 ## Architecture
 - `bot.py`: Telegram bot (python-telegram-bot v21) and the main loop. Self-scheduling `tick()` →
@@ -10,12 +11,14 @@ before it's sent. Nothing is ever sent without the user tapping ✅. See README.
   same-person check, the same flat on another site (`same_flat`) → commute → LLM → card). Also
   `check_replies()` (inbox), `/excel`, `/test`.
   `SITES` holds every supported site; a search's URL decides its site. Blocks, budgets and
-  cooldowns are per site, so one site pushing back doesn't stop the others.
+  cooldowns are per site, so one site pushing back doesn't stop the others. A `send_by_hand` site
+  (ImmoScout24) gets `📤 I sent it` instead of `✅ Send`, no inbox check and no `--login`.
 - `sites.py`: what all sites share. `Listing` (ids of sites other than WG-Gesucht carry a prefix, e.g.
   `ka:`), `Browser` (one persistent Chromium profile `browser-profile/` for all sites, logged in via
   `--login`; session-only cookies are saved to `browser-session.json` on stop and restored on start),
   and the `Site` base class: `search`, `fetch_details`, `logged_in_on`, `send_message`, `inbox`,
-  plus `_goto` (every page load, through the site's RateGuard).
+  `check_search_url`, plus `_goto` (every page load, through the site's RateGuard). Chromium starts on
+  first use, so an ImmoScout-only setup never launches it.
 - `wg.py`: WG-Gesucht. `CARDS_JS`, `DETAIL_JS` and `INBOX_JS` are the selectors. `send_message()` goes
   straight to `/nachricht-senden/...`, checks `#message_timestamp`, and confirms success through the
   `api.php?action=conversations` response. Login is checked on `/nachrichten.html`, never the
@@ -24,6 +27,11 @@ before it's sent. Nothing is ever sent without the user tapping ✅. See README.
   utility CSS classes, so `CARDS_JS` goes by structure; ad pages come in two A/B layouts (classic and
   the 2026 redesign), both keep the `viewad-*` ids, and the redesign's coordinates come from its embedded
   page data (`LOCATION_RE`). Sending and the inbox are not verified live yet (`send_verified = False`).
+- `immoscout.py`: ImmoScout24, read-only through the app's JSON API (`api.mobile.immobilienscout24.de`,
+  the app's User-Agent), because the website shows "Ich bin kein Roboter" to automated browsers on the first
+  request. `api_params()` turns the website's search URL into an API query (the filters carry over).
+  `apply_detail()` reads the ad's sections; `contact_note` says when only Plus members may write.
+  The advertiser id (`obj_cId`) is used only for private advertisers, since agencies have many flats.
 - `guard.py`: request budget (pages per hour and per day) and escalating block cooldowns, one per site,
   saved to SQLite.
 - `commute.py`: Transitous `/api/v1/plan` (bike + transit) from the ad's `map_config` coordinates;
@@ -36,8 +44,11 @@ before it's sent. Nothing is ever sent without the user tapping ✅. See README.
 
 ## Rules for working on this
 - Never send real messages while testing; keep `send.dry_run: true` unless the user says otherwise.
-- Keep request volume low; every page load must go through `Site._goto` (RateGuard).
-- Don't add captcha solving or anti-detection stealth; on a block, pause and notify instead.
+- Keep request volume low; every page load must go through `Site._goto`, every ImmoScout24 API request
+  through `ImmoScout._api` (both count against the site's RateGuard).
+- Don't add captcha solving or anti-detection stealth; on a block, pause and notify instead. The one
+  approved exception is ImmoScout24's app API with the app's User-Agent: keep it read-only (no login,
+  no sending) and low volume.
 - Never commit `config.yaml`, `CLAUDE.local.md`, `browser-profile/`, `browser-session.json`, `wg.sqlite`,
   `applications.xlsx` or `screenshots/` (personal data, session cookies). They are in `.gitignore`.
 - New config keys need a default in code, so existing `config.yaml` files keep working.

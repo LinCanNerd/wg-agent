@@ -13,7 +13,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from playwright.async_api import TimeoutError as PWTimeout
 
-from sites import Listing, LoggedOut, Site, is_commercial
+from sites import EXCHANGE_RE, Listing, LoggedOut, Site, guess_kind, is_commercial
 
 log = logging.getLogger("kleinanzeigen")
 BASE = "https://www.kleinanzeigen.de"
@@ -22,8 +22,6 @@ ID_RE = re.compile(r"/(\d{8,12})-(\d+)-\d+")  # /s-anzeige/<slug>/1234567890-199
 EURO_RE = re.compile(r"(\d[\d.]*)(?:,\d+)?\s*€")
 SIZE_RE = re.compile(r"(\d+)(?:,\d+)?\s*m²")
 DATE_RE = re.compile(r"(\d{2}\.\d{2}\.\d{4})")
-EXCHANGE_RE = re.compile(r"tauschangebot|wohnungstausch|tauschwohnung|zimmertausch", re.I)
-WG_TITLE_RE = re.compile(r"\bwg\b|wg-?zimmer|mitbewohner|zimmer in (einer|meiner|unserer)", re.I)
 MONTHS = "januar februar märz april mai juni juli august september oktober november dezember".split()
 ROOM_CATEGORY, FLAT_CATEGORY = "199", "203"  # Auf Zeit & WG, Mietwohnungen
 INBOX_URL = BASE + "/m-nachrichten.html"
@@ -52,11 +50,6 @@ def _month_start(s):
 
 def _large(url):
     return re.sub(r"rule=\$_\d+\.AUTO", "rule=$_59.AUTO", url)
-
-
-def guess_kind(title, kind):
-    """People post WG rooms in the flats category too: a title about a WG makes it a room."""
-    return "room" if kind == "studio" and WG_TITLE_RE.search(title or "") else kind
 
 
 def listing_from_url(url: str) -> Listing:

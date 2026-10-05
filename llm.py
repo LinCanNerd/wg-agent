@@ -152,13 +152,44 @@ def drop_bad_sentences(text: str) -> str:
     return " ".join(s for s in parts if not BAD_SENTENCE.search(s))
 
 
+COMPANY_RE = re.compile(r"gmbh|immobilien|wohnen|morgen|team|\d", re.I)
+SALUTATION_RE = re.compile(r"^(herr|frau|hr\.|fr\.|mr\.?|mrs\.?|ms\.?)\s+", re.I)
+
+
 def first_name(poster: str) -> str:
-    """'Anna Schmidt' -> 'Anna'; skips company-ish names and initials-only."""
+    """'Anna Schmidt' / 'Frau Anna Schmidt' -> 'Anna'; '' for 'Herr Schmidt', company-ish names and initials."""
     p = (poster or "").strip()
-    if not p or re.search(r"gmbh|immobilien|wohnen|morgen|team|\d", p, re.I):
+    if not p or COMPANY_RE.search(p):
         return ""
+    if SALUTATION_RE.match(p):  # after Herr/Frau, a single word is the surname
+        p = SALUTATION_RE.sub("", p)
+        if len(p.split()) < 2:
+            return ""
     w = p.split()[0].strip(".")
     return w if len(w) > 1 and w[0].isupper() else ""
+
+
+# salutation as advertisers write it -> (German, English)
+TITLES = {
+    "herr und frau": ("Herr und Frau", "Mr and Mrs"),
+    "frau und herr": ("Frau und Herr", "Mrs and Mr"),
+    "herr": ("Herr", "Mr"),
+    "frau": ("Frau", "Ms"),
+    "mr": ("Herr", "Mr"),
+    "mrs": ("Frau", "Mrs"),
+    "ms": ("Frau", "Ms"),
+}
+FORMAL_RE = re.compile(rf"({'|'.join(TITLES)})\.?\s+(?:.+\s)?([^\s.]{{2,}})$", re.I)
+
+
+def formal_name(poster: str, lang: str = "de") -> str:
+    """'Herr Max Mustermann' -> 'Herr Mustermann' ('Mr Mustermann' in English); '' without a salutation."""
+    p = (poster or "").strip()
+    m = FORMAL_RE.match(p)
+    if not m or COMPANY_RE.search(p) or m.group(2).isupper() or not m.group(2)[0].isupper():  # "Frau Anna AB"
+        return ""
+    de, en = TITLES[re.sub(r"\s+", " ", m.group(1).lower())]
+    return f"{en if lang == 'en' else de} {m.group(2)}"
 
 
 SYSTEM = """You help one person find a home in {city}. Ads are WG rooms or studios (TYPE says which).
@@ -318,7 +349,7 @@ class LLM:
             if l.kind == "studio"
             else "Room in a shared flat (WG)"
         )
-        name = first_name(l.poster)
+        name = (formal_name(l.poster) if l.kind == "studio" else "") or first_name(l.poster)
         return (
             f"TODAY: {date.today():%d.%m.%Y}\nTYPE: {kind}\nTITLE: {l.title}\n"
             f"CONTACT NAME: {name or 'unknown - do not use a name'}\n"
@@ -385,11 +416,12 @@ class LLM:
             log.warning("template mode, but no me.templates.%s_%s: sending only the model's part", kind, lang)
             return body
         name = first_name(l.poster)
+        formal = formal_name(l.poster, lang) if kind == "studio" else ""  # a landlord who signs as Herr/Frau X
         greet = {
             ("de", "room"): f"Hallo {name}," if name else "Hallo zusammen,",
             ("en", "room"): f"Hi {name}," if name else "Hi everyone,",
-            ("de", "studio"): f"Hallo {name}," if name else "Guten Tag,",
-            ("en", "studio"): f"Hello {name}," if name else "Hello,",
+            ("de", "studio"): f"Guten Tag {formal}," if formal else f"Hallo {name}," if name else "Guten Tag,",
+            ("en", "studio"): f"Hello {formal}," if formal else f"Hello {name}," if name else "Hello,",
         }[(lang, kind)]
         body = body.strip()
         first = ""
