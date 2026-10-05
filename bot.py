@@ -318,6 +318,29 @@ def hard_filter(l: Listing, extra_text="") -> str | None:
 
 
 # ---------------- telegram UI ----------------
+def link_buttons(l: Listing) -> list:
+    links = [InlineKeyboardButton(f"🔗 {SITES[l.site].label if l.site in SITES else 'Ad'}", url=l.url)]
+    if l.lat:
+        links.append(
+            InlineKeyboardButton("🗺 Map", url=f"https://www.google.com/maps/search/?api=1&query={l.lat},{l.lng}")
+        )
+        dest = (CFG.get("commute") or {}).get("destinations") or []
+        if dest:
+            links.append(
+                InlineKeyboardButton(
+                    "🚲 Route",
+                    url=f"https://www.google.com/maps/dir/?api=1&origin={l.lat},{l.lng}"
+                    f"&destination={html.escape(dest[0].get('query', ''))}&travelmode=bicycling",
+                )
+            )
+    return links
+
+
+def links_keyboard(l: Listing):
+    """What stays on a card once it's sent or skipped: the ad, map and route links, no action buttons."""
+    return InlineKeyboardMarkup([link_buttons(l)])
+
+
 def keyboard(lid, l: Listing | None = None):
     rows = [
         [
@@ -330,21 +353,7 @@ def keyboard(lid, l: Listing | None = None):
         ],
     ]
     if l:
-        links = [InlineKeyboardButton(f"🔗 {SITES[l.site].label if l.site in SITES else 'Ad'}", url=l.url)]
-        if l.lat:
-            links.append(
-                InlineKeyboardButton("🗺 Map", url=f"https://www.google.com/maps/search/?api=1&query={l.lat},{l.lng}")
-            )
-            dest = (CFG.get("commute") or {}).get("destinations") or []
-            if dest:
-                links.append(
-                    InlineKeyboardButton(
-                        "🚲 Route",
-                        url=f"https://www.google.com/maps/dir/?api=1&origin={l.lat},{l.lng}"
-                        f"&destination={html.escape(dest[0].get('query', ''))}&travelmode=bicycling",
-                    )
-                )
-        rows.append(links)
+        rows.append(link_buttons(l))
     return InlineKeyboardMarkup(rows)
 
 
@@ -879,7 +888,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if action == "skip":
         DB_.update(lid, status="skipped")
         await q.answer("Skipped")
-        await q.edit_message_reply_markup(None)
+        await q.edit_message_reply_markup(links_keyboard(l))
     elif action in ("edit", "rewrite"):
         await q.answer()
         ctx.user_data["pending"] = (action, lid)
@@ -900,10 +909,10 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"about another ad ({prev['title'] or prev['id']})."
             )
             DB_.update(lid, status="same_person")
-            await q.edit_message_reply_markup(None)
+            await q.edit_message_reply_markup(links_keyboard(l))
             return
         await q.answer("Sending…")
-        await q.edit_message_reply_markup(None)
+        await q.edit_message_reply_markup(links_keyboard(l))  # no second ✅ while it sends; links stay
         site = SITES[l.site]
         dry = site_dry_run(site)
         try:
