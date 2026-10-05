@@ -114,11 +114,7 @@ def match_conversation(conv: dict, sent_rows) -> list:
         score = 0
         if t and title and (t == title or (len(t) > 12 and (t in title or title in t))):
             score += 2
-        if (
-            n
-            and poster
-            and (n == poster or n.split()[0:1] == poster.split()[0:1] or poster.startswith(n) or n.startswith(poster))
-        ):
+        if n and poster and (poster.startswith(n) or n.startswith(poster)):  # "Anna" and "Anna Schmidt"
             score += 1
         if score:
             hits.append((score, r))

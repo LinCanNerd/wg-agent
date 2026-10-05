@@ -44,12 +44,12 @@ def _size(s):
 
 
 def _date(s):
-    """'4.10.2026' / '31.10.26' -> '04.10.2026', 'sofort' -> today."""
+    """'4.10.2026' / '31.10.26' -> '04.10.2026', 'sofort' / 'ab sofort' -> today."""
     s = (s or "").strip().lower()
     if m := DATE_RE.search(s):
         d, mon, y = m.groups()
         return f"{int(d):02d}.{int(mon):02d}.{y if len(y) == 4 else '20' + y}"
-    return f"{date.today():%d.%m.%Y}" if s.startswith("sofort") else None
+    return f"{date.today():%d.%m.%Y}" if re.search(r"\bsofort\b", s) else None
 
 
 def age_minutes(s):

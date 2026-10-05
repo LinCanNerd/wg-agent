@@ -178,6 +178,8 @@ TITLES = {
     "mr": ("Herr", "Mr"),
     "mrs": ("Frau", "Mrs"),
     "ms": ("Frau", "Ms"),
+    "hr": ("Herr", "Mr"),
+    "fr": ("Frau", "Ms"),
 }
 FORMAL_RE = re.compile(rf"({'|'.join(TITLES)})\.?\s+(?:.+\s)?([^\s.]{{2,}})$", re.I)
 
@@ -343,13 +345,13 @@ class LLM:
         return f"{msg.rstrip()}\nWhatsApp: {phone}"
 
     @staticmethod
-    def _ad(l, commute_text=""):
+    def _ad(l, commute_text="", lang="de"):
         kind = (
             "STUDIO / 1-room apartment (I'd live alone; write to the landlord or current tenant)"
             if l.kind == "studio"
             else "Room in a shared flat (WG)"
         )
-        name = (formal_name(l.poster) if l.kind == "studio" else "") or first_name(l.poster)
+        name = (formal_name(l.poster, lang) if l.kind == "studio" else "") or first_name(l.poster)
         return (
             f"TODAY: {date.today():%d.%m.%Y}\nTYPE: {kind}\nTITLE: {l.title}\n"
             f"CONTACT NAME: {name or 'unknown - do not use a name'}\n"
@@ -453,7 +455,7 @@ class LLM:
         user = self._profile()
         if self.template_mode and (tpl := self._template(listing.kind, lang)):
             user += f"\n\n=== MY FIXED TEXT (your part goes where {{personal}} is) ===\n{tpl}"
-        user += "\n\n=== AD ===\n" + self._ad(listing, commute_text)
+        user += "\n\n=== AD ===\n" + self._ad(listing, commute_text, lang)
         if traps := find_traps(f"{listing.title}\n{listing.description}"):
             user += "\n\n=== POSSIBLE TESTS IN THE AD (found by a text search; check each) ===\n" + "\n".join(
                 f"- {t}" for t in traps
@@ -497,7 +499,9 @@ class LLM:
                     want_json=False,
                 )
                 msg = " ".join(
-                    x for x in re.split(r"(?<=[.!?])\s+", msg.strip()) if not PRAISE_RE.search(x) or (kw and kw in x)
+                    x
+                    for x in re.split(r"(?<=[.!?])\s+", msg.strip())
+                    if not PRAISE_RE.search(x) or (kw and kw.lower() in x.lower())
                 )
             if kw and plain_start:  # the template puts it first itself: drop it from the part
                 msg = strip_code_sentences(msg, kw)
@@ -516,7 +520,7 @@ class LLM:
             # it rejected the ad (e.g. day rentals only) and wrote nothing: that's a low score, not an error
             if d["score"] <= 3:
                 d["message"] = ""
-                return d
+                return self._flag_scams(listing, d)
             raise ValueError(f"LLM returned no usable message: {raw[:300]}")
         if (kw := d["keyword"]) and kw.lower() not in msg.lower():  # model forgot the code word: one retry
             where = "as the very first word of the message" if d["keyword_at_start"] else "wherever it fits"
@@ -590,7 +594,7 @@ class LLM:
         user = (
             self._profile()
             + "\n\n=== AD ===\n"
-            + self._ad(listing, commute_text)
+            + self._ad(listing, commute_text, lang)
             + f"\n\n=== PREVIOUS DRAFT ===\n{previous}\n\n=== WHAT TO CHANGE ===\n{feedback}"
         )
         return self.with_contact(await self._chat(system, user, want_json=False))

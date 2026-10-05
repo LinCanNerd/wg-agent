@@ -181,11 +181,12 @@ all come from your IP address: with several people, check each site less often (
 |---|---|
 | `/status` | what the agent is doing, page budget, database counts |
 | `/check` | check the searches now |
-| `/replies` | check the inbox now |
+| `/replies` | check the inboxes now |
 | `/excel` | get `applications.xlsx` |
 | `/pause`, `/resume` | stop / restart polling |
 | `/test <url>` | score and draft any ad (ignores filters) |
 | `/login_check` | is the browser still logged in to each site? |
+| `/summary` | the daily review right now |
 
 ## Staying polite to the sites
 

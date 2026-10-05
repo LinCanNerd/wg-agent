@@ -25,7 +25,7 @@ class RateGuard:
         self.c = conn
         self.key = key  # kv row; WG-Gesucht keeps the original "guard" so its counts survive the update
         self.per_hour = int(cfg.get("max_pages_per_hour", 40))
-        self.per_day = int(cfg.get("max_pages_per_day", 600))
+        self.per_day = int(cfg.get("max_pages_per_day", 650))
         self.cooldowns = [m * 60 for m in cfg.get("block_cooldown_minutes", [15, 60, 180, 720])]
         self.c.execute("CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT)")
         self.c.commit()

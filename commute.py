@@ -298,7 +298,7 @@ class Commute:
     def prompt_text(self, res):
         if not res:
             return "COMMUTE: unknown (no location)."
-        lines = ["COMMUTE (real routing, weekday 08:00 departure):"]
+        lines = [f"COMMUTE (real routing, weekday {self.cfg.get('depart', '08:00')} departure):"]
         for d in self.dests:
             r = res.get(d["name"])
             if not r:

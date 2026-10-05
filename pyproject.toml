@@ -1,7 +1,7 @@
 [project]
 name = "wg-agent"
 version = "0.1.0"
-description = "WG-Gesucht flat-hunting agent: LLM drafts, Telegram approval, nothing sent without you"
+description = "Flat-hunting agent (WG-Gesucht, Kleinanzeigen, ImmoScout24): LLM drafts, Telegram approval, nothing sent without you"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"

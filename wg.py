@@ -11,7 +11,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from playwright.async_api import TimeoutError as PWTimeout
 
-from sites import Listing, LoggedOut, Site, is_commercial
+from sites import EXCHANGE_RE, Listing, LoggedOut, Site, is_commercial
 
 log = logging.getLogger("wg")
 BASE = "https://www.wg-gesucht.de"
@@ -233,9 +233,7 @@ def apply_detail(l: Listing, d: dict, html: str) -> Listing:
         r"(\d+)\s*(Bewerbungen|Bewerber|Anfragen|Interessent|applicants|applications|requests)", d.get("head", ""), re.I
     ):
         l.applicants = int(m.group(1))
-    l.exchange = bool(
-        re.search(r"tauschangebot|wohnungstausch|tauschwohnung|zimmertausch", f"{l.title} {l.description}", re.I)
-    )
+    l.exchange = bool(EXCHANGE_RE.search(f"{l.title} {l.description}"))
     if m := COORD_RE.search(html):
         l.lat, l.lng = float(m.group(1)), float(m.group(2))
     return l
@@ -243,7 +241,7 @@ def apply_detail(l: Listing, d: dict, html: str) -> Listing:
 
 def latest_is_mine(conv: dict) -> bool:
     """The inbox preview starts the newest message with "Ich:" (English site: "Me:"/"You:") when I wrote it,
-    e.g. "Ji Li (, 48) Möbliertes Zimmer ... Ich: thanks, see you at 6"."""
+    e.g. "Anna (, 25) Möbliertes Zimmer ... Ich: thanks, see you at 6"."""
     text, title = conv.get("text") or "", conv.get("title") or ""
     if title and title in text:
         return bool(re.match(r"\s*(Ich|Me|You):\s", text.split(title, 1)[1]))

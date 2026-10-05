@@ -18,6 +18,7 @@ import time
 from datetime import datetime
 from datetime import time as dtime
 from pathlib import Path
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import yaml
@@ -95,10 +96,20 @@ class DB:
     def get(self, lid):
         return self.c.execute("SELECT * FROM listings WHERE id=?", (lid,)).fetchone()
 
-    def queued(self, n):
-        rows = self.c.execute("SELECT * FROM listings WHERE status='queued'").fetchall()
-        # freshest ad first (by WG-Gesucht's "Online: x min"), not by id – ids aren't chronological
-        rows.sort(key=lambda r: (json.loads(r["data"]).get("online_min") or 10**6, -r["created"]))
+    def queued(self, n, skip_sites=()):
+        """The n freshest queued ads, leaving out sites that sit this poll out (they'd hold up the others)."""
+        now = time.time()
+        rows = [
+            r
+            for r in self.c.execute("SELECT * FROM listings WHERE status='queued'")
+            if (r["site"] or "wg-gesucht") not in skip_sites
+        ]
+
+        def age(r):  # the site's "Online: x min" when we saw the card, plus the time since; ids aren't chronological
+            online = json.loads(r["data"]).get("online_min")
+            return (10**6 if online is None else online) + (now - r["created"]) / 60
+
+        rows.sort(key=age)
         return rows[:n]
 
     def expire_queue(self, hours):
@@ -111,7 +122,7 @@ class DB:
         """Same flat re-uploaded under a new id (Fredy/jonasdieker idea)."""
         r = self.c.execute(
             "SELECT id, status FROM listings WHERE fp=? AND id<>? AND created > ? "
-            "AND status IN ('pending','sent','skipped','low_score','filtered','already') LIMIT 1",
+            "AND status IN ('pending','sent','replied','skipped','low_score','filtered','already') LIMIT 1",
             (fp, lid, time.time() - 30 * 86400),
         ).fetchone()
         return r
@@ -144,7 +155,9 @@ class DB:
         return True
 
     def same_person(self, l: Listing):
-        """Have I already written to this advertiser (any of their ads)?"""
+        """Have I already written to this advertiser (any of their ads)? Never for agencies: they have many flats."""
+        if "Anbieter: gewerblich" in l.details:  # Kleinanzeigen and ImmoScout24 say so in the key facts
+            return None
         if l.poster_id and self._poster_id_ok(l.poster_id):
             r = self.c.execute(
                 "SELECT id, title FROM listings WHERE poster_id=? AND id<>? AND status IN ('sent','replied','already')",
@@ -329,11 +342,17 @@ def link_buttons(l: Listing) -> list:
         )
         dest = (CFG.get("commute") or {}).get("destinations") or []
         if dest:
+            d = dest[0]
+            to = (
+                f"{d['lat']},{d['lng']}"
+                if d.get("lat") is not None and d.get("lng") is not None
+                else d.get("query", "")
+            )
             links.append(
                 InlineKeyboardButton(
                     "🚲 Route",
                     url=f"https://www.google.com/maps/dir/?api=1&origin={l.lat},{l.lng}"
-                    f"&destination={html.escape(dest[0].get('query', ''))}&travelmode=bicycling",
+                    f"&destination={quote(str(to), safe=',')}&travelmode=bicycling",
                 )
             )
     return links
@@ -744,7 +763,7 @@ async def _poll(ctx, st):
             await asyncio.sleep(random.uniform(8, 20))
         kind = sc.get("kind", "room")
         key = f"{site.name}/{kind}"
-        url = site.prepare_search_url(sc["url"], sc.get("max_rent"), CFG["search"].get("min_size"))
+        url = site.prepare_search_url(sc["url"], sc.get("max_rent"), sc.get("min_size", CFG["search"].get("min_size")))
         try:
             listings = await site.search(url, kind)
         except Exception as e:
@@ -784,7 +803,8 @@ async def _poll(ctx, st):
 
     # Open at most N ads per poll (freshest first); the rest wait for the next poll.
     DB_.expire_queue(hours=24)
-    for r in DB_.queued(int(p.get("max_details_per_poll", 3))):
+    resting.update(s.name for s in SITES.values() if s.guard.cooling_left())
+    for r in DB_.queued(int(p.get("max_details_per_poll", 3)), skip_sites=resting):
         l = Listing.from_dict(json.loads(r["data"]))
         site = SITES[l.site]
         if site.name in resting or site.guard.cooling_left():
@@ -818,6 +838,7 @@ async def check_replies(bot):
     """Read the inbox of every site I've sent messages on."""
     if ctx_paused(bot):
         return
+    failed = []
     for site in SITES.values():
         sent = DB_.sent_rows(site.name)
         if not sent or site.send_by_hand or site.guard.cooling_left():
@@ -832,6 +853,11 @@ async def check_replies(bot):
             )
         except (Blocked, BudgetExceeded, CoolingDown) as e:
             await site_trouble(bot, APP.bot_data, site, e)
+        except Exception as e:  # one site's trouble mustn't skip the other inboxes
+            log.exception("%s reply check failed", site.label)
+            failed.append(f"{site.label}: {e}")
+    if failed:
+        raise RuntimeError("; ".join(failed))
 
 
 async def check_site_replies(bot, site: Site, sent):
@@ -932,7 +958,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         await q.message.reply_text(prompt)
     elif action == "send":
-        if r["status"] in ("sent", "already"):
+        if r["status"] in ("sent", "replied", "already"):
             await q.answer("Already sent")
             return
         if prev := DB_.same_person(l):
@@ -999,7 +1025,14 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("✍️ Rewriting…")
         l = Listing.from_dict(json.loads(r["data"]))
-        draft = await LLM_.rewrite(l, r["lang"] or "de", r["draft"], text, COMMUTE_.prompt_text(l.commute))
+        try:
+            draft = await LLM_.rewrite(l, r["lang"] or "de", r["draft"], text, COMMUTE_.prompt_text(l.commute))
+        except Exception as e:
+            log.exception("rewrite failed")
+            await update.message.reply_text(
+                f"❌ Rewrite failed ({e.__class__.__name__}). The card still has the old draft; tap 🔁 Rewrite to retry."
+            )
+            return
     meta = json.loads(r["note"]) if (r["note"] or "").startswith("{") else {}
     meta["translation"] = await english_version(draft, meta.get("keyword"))  # keep it in sync with the draft
     DB_.update(lid, draft=draft, note=json.dumps(meta))
@@ -1060,6 +1093,12 @@ async def cmd_resume(update: Update, ctx):
 
 
 async def cmd_check(update: Update, ctx):
+    if ctx.bot_data["paused"]:
+        await update.message.reply_text("⏸ Paused: /resume first.")
+        return
+    if ctx.bot_data["poll_lock"].locked():
+        await update.message.reply_text("🔎 Already checking.")
+        return
     cooling = [s.guard.cooling_left() for s in active_sites()]
     if all(cooling):
         await update.message.reply_text(f"🧊 Cooling down after a block ({min(cooling) // 60} min left), not checking.")
@@ -1102,6 +1141,11 @@ async def cmd_test(update: Update, ctx):
         await update.message.reply_text(str(e))
         return
     l = site.listing_from_url(ctx.args[0])
+    if (old := DB_.get(l.id)) and old["status"] in ("sent", "replied", "already"):  # keep what was really sent
+        await update.message.reply_text(
+            f"You already wrote to this ad (status: {old['status']}), so /test won't replace its draft and status."
+        )
+        return
     DB_.add(l, status="test")
     await update.message.reply_text("⏳ Reading ad, checking commute, drafting…")
     try:

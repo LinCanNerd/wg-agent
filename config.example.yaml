@@ -140,7 +140,7 @@ commute:
 
 replies:
   enabled: true
-  check_minutes: 12           # read your WG-Gesucht inbox every ~12 min (1 page load)
+  check_minutes: 12           # read your inboxes every ~12 min (1 page load per site you've sent on)
   night_check_minutes: 60
   excel_path: "applications.xlsx"   # every sent message + status (sent / replied); /excel in Telegram
 
