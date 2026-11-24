@@ -4,7 +4,6 @@ Search and ad pages were checked against the live site on 2026-10-02. Sending an
 are not verified yet, so sending is a dry run until `sites.kleinanzeigen.dry_run: false` (send_verified).
 """
 
-import asyncio
 import logging
 import re
 from datetime import datetime
@@ -389,31 +388,19 @@ class Kleinanzeigen(Site):
             if not btn:
                 return "failed", await self._shot(page, "nobutton"), "Send button not found"
 
-            api_ok = asyncio.get_running_loop().create_future()
+            async def verdict(resp):  # not verified live: an error here may be about another request
+                ours = resp.request.method == "POST" and "kontakt" in resp.url.lower()
+                return "sent" if ours and resp.ok else None
 
-            async def on_resp(resp):
-                if resp.request.method == "POST" and "kontakt" in resp.url.lower() and not api_ok.done():
-                    api_ok.set_result(resp.ok)
-
-            page.on("response", on_resp)
-            await btn.click(timeout=10000)
-            ok = False
-            try:
-                ok = await asyncio.wait_for(asyncio.shield(api_ok), timeout=12)
-            except asyncio.TimeoutError:
-                pass
-            if not ok:  # UI fallback: the page says it went out
+            async def shown():  # the page says it went out
+                said = page.get_by_text(re.compile(r"nachricht.{0,30}(gesendet|verschickt)", re.I)).first
                 try:
-                    await page.get_by_text(re.compile(r"nachricht.{0,30}(gesendet|verschickt)", re.I)).first.wait_for(
-                        timeout=6000
-                    )
-                    ok = True
+                    await said.wait_for(timeout=6000)
+                    return True
                 except PWTimeout:
-                    pass
-            shot = await self._shot(page, "sent" if ok else "unsure")
-            if ok:
-                return "sent", shot, "Sent ✅"
-            return "failed", shot, "Clicked send but couldn't confirm – check the screenshot"
+                    return False
+
+            return await self._click_send(page, btn, verdict, shown)
 
     async def inbox(self) -> list[dict]:
         """The message box is an app that loads its conversation list as JSON: catch that (1 page load)."""

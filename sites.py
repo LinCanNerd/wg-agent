@@ -88,6 +88,7 @@ class Listing:
     member_since: str = ""
     send_url: str = ""
     exchange: bool = False  # Tauschangebot
+    search: str = ""  # URL of the search in config.yaml that found it
     contact_note: str = ""  # who may write, e.g. "Only ImmoScout Plus members can write until Fri 09.10. 12:44"
     commute: dict = field(default_factory=dict)
     commute_text: str = ""
@@ -246,7 +247,8 @@ class Site:
         raise NotImplementedError
 
     async def send_message(self, l: Listing, text: str, dry_run=True):
-        """Returns (status, screenshot_path, info). status: sent | dry_run | already | failed."""
+        """Returns (status, screenshot_path, info). status: sent | dry_run | already | failed (certainly not
+        sent) | unsure (Send was clicked, but nothing confirmed it)."""
         raise NotImplementedError
 
     async def inbox(self) -> list[dict]:
@@ -314,6 +316,43 @@ class Site:
 
     async def _shot(self, page, tag):
         return await self.browser.shot(page, f"{self.name}_{tag}")
+
+    async def _click_send(self, page, btn, verdict, shown, wait=12):
+        """Click Send and find out what happened. verdict(response) -> "sent" | "failed" | "unsure" | None (not
+        about the message); shown() -> whether the page shows it, asked only if no response settled it."""
+        verdicts, sent = set(), asyncio.Event()
+
+        async def on_resp(resp):
+            try:
+                v = await verdict(resp)
+            except Exception:
+                return
+            verdicts.add(v)
+            if v == "sent":
+                sent.set()
+
+        page.on("response", on_resp)
+        status = "unsure"
+        try:
+            await btn.click(timeout=10000)
+            try:
+                await asyncio.wait_for(sent.wait(), timeout=wait)
+            except asyncio.TimeoutError:
+                pass
+            settled = next((v for v in ("sent", "failed", "unsure") if v in verdicts), None)
+            status = settled or ("sent" if await shown() else "unsure")
+        except Exception:  # from the click on, an error doesn't mean it wasn't sent
+            log.exception("%s: error after clicking Send", self.label)
+        try:
+            shot = await self._shot(page, status)
+        except Exception:
+            shot = None
+        info = {
+            "sent": "Sent ✅",
+            "failed": f"{self.label} rejected the message",
+            "unsure": "Clicked Send but couldn't confirm it – check the screenshot or your inbox on the site",
+        }
+        return status, shot, info[status]
 
     async def _first_visible(self, page, selectors, timeout=8000):
         """Try selectors one by one (a comma list + .first would pick by page order, not priority)."""

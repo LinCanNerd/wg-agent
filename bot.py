@@ -44,6 +44,7 @@ CFG: dict = {}
 SITE_TYPES = (WGGesucht, Kleinanzeigen, ImmoScout)
 SITES: dict[str, Site] = {}  # every supported site; only the ones with a search are polled
 DONE = ("sent", "replied", "already")  # written to: never overwrite these rows' status or draft
+CONTACTED = (*DONE, "unsure")  # unsure: Send was clicked but not confirmed; you say whether it went out
 RETRY_MINUTES = (10, 30, 60, 120)  # waits after a failure (LLM down, network...) before an ad is given up on
 # A one-shot job that is more than 1 s late (stalled loop, laptop asleep) is dropped by default, and the
 # self-scheduling loops would never run again: run it late instead.
@@ -143,9 +144,11 @@ class DB:
 
     def repost_of(self, fp, lid):
         """Same flat re-uploaded under a new id (Fredy/jonasdieker idea)."""
+        if not fp:
+            return None
         r = self.c.execute(
             "SELECT id, status FROM listings WHERE fp=? AND id<>? AND created > ? "
-            "AND status IN ('pending','sent','replied','skipped','low_score','filtered','already') LIMIT 1",
+            "AND status IN ('pending','sent','replied','skipped','low_score','filtered','already','unsure') LIMIT 1",
             (fp, lid, time.time() - 30 * 86400),
         ).fetchone()
         return r
@@ -155,7 +158,7 @@ class DB:
         rows = self.c.execute(
             "SELECT id, status, data, COALESCE(site, 'wg-gesucht') AS site FROM listings "
             "WHERE COALESCE(site, 'wg-gesucht') <> ? AND created > ? "
-            "AND status IN ('pending','sent','replied','skipped','low_score','already')",
+            "AND status IN ('pending','sent','replied','skipped','low_score','already','unsure')",
             (l.site, time.time() - 30 * 86400),
         ).fetchall()
         for r in rows:
@@ -183,27 +186,26 @@ class DB:
             return None
         if l.poster_id and self._poster_id_ok(l.poster_id):
             r = self.c.execute(
-                "SELECT id, title FROM listings WHERE poster_id=? AND id<>? AND status IN ('sent','replied','already')",
+                "SELECT id, title FROM listings WHERE poster_id=? AND id<>? AND status IN ('sent','replied','already','unsure')",
                 (l.poster_id, l.id),
             ).fetchone()
             if r:
                 return r
-        if l.poster and len(l.poster) > 3:  # fallback without id: same name + same street
-            street = (l.address or l.street or "").split()[0:1]
+        street = _street_name(l)
+        if l.poster and len(l.poster) > 3 and street:  # fallback without id: same name + same street
             for r in self.c.execute(
-                "SELECT id, title, data FROM listings WHERE id<>? AND status IN ('sent','replied','already')", (l.id,)
+                "SELECT id, title, data FROM listings WHERE id<>? AND status IN ('sent','replied','already','unsure')",
+                (l.id,),
             ):
-                d = json.loads(r["data"])
-                if (
-                    d.get("poster") == l.poster
-                    and street
-                    and (d.get("address") or d.get("street") or "").split()[0:1] == street
-                ):
+                d = Listing.from_dict(json.loads(r["data"]))
+                if d.site == l.site and d.poster_id and l.poster_id and d.poster_id != l.poster_id:
+                    continue  # two accounts: two people with the same name
+                if d.poster == l.poster and _street_name(d) == street:
                     return r
         return None
 
     def sent_rows(self, site=None):
-        rows = self.c.execute("SELECT * FROM listings WHERE status IN ('sent','replied','already')").fetchall()
+        rows = self.c.execute("SELECT * FROM listings WHERE status IN ('sent','replied','already','unsure')").fetchall()
         return [r for r in rows if site is None or (r["site"] or "wg-gesucht") == site]
 
     def kv_get(self, k, default=None):
@@ -214,22 +216,44 @@ class DB:
         self.c.execute("INSERT OR REPLACE INTO kv(k, v) VALUES(?, ?)", (k, json.dumps(v)))
         self.c.commit()
 
+    def refresh_fingerprints(self):
+        """Once after an update that changed fingerprint(): recompute the stored ones, or reposts go unnoticed."""
+        if self.kv_get("fp_version") == FP_VERSION:
+            return
+        for r in self.c.execute("SELECT id, data FROM listings WHERE fp IS NOT NULL").fetchall():
+            fp = fingerprint(Listing.from_dict(json.loads(r["data"])))
+            self.c.execute("UPDATE listings SET fp=? WHERE id=?", (fp, r["id"]))
+        self.c.commit()
+        self.kv_set("fp_version", FP_VERSION)
+
     def stats(self):
         return dict(self.c.execute("SELECT status, COUNT(*) FROM listings GROUP BY status").fetchall())
 
 
+FP_VERSION = 2
+
+
+def _street(l: Listing) -> str:
+    """Street and house number, or "" if the ad only gives the area: what stands before the postcode."""
+    m = re.match(r"(.*?)\b\d{5}\b", l.address or "", re.S)
+    return (m.group(1) if m else "").strip(" ,\n") or l.street or ""
+
+
 def fingerprint(l: Listing) -> str:
-    street = re.sub(r"[^a-zäöüß]", "", (l.address or l.street or "").lower().split("\n")[0])[:25]
-    fp = f"{l.kind}|{street}|{l.size}|{round((l.rent or 0) / 25)}"
-    if not l.street and l.poster_id:  # only the postcode area is known: too vague without the advertiser
-        fp += f"|{l.poster_id}"
-    return fp
+    """The same for reposts of one flat; "" if the ad says too little about where it is and whose it is."""
+    street = re.sub(r"(strasse|str\.?)(?![a-zäöüß])", "straße", _street(l).lower())
+    street = re.sub(r"[^a-zäöüß0-9]", "", street)[:40]
+    if not street and not l.poster_id:
+        return ""
+    m = re.search(r"\b\d{5}\b", l.address or "")
+    fp = f"{l.kind}|{street}|{m.group(0) if m else ''}|{l.size}|{round((l.rent or 0) / 25)}"
+    return fp if street else f"{fp}|{l.poster_id}"  # only the area is known: too vague without the advertiser
 
 
 def _street_name(l: Listing) -> str:
     """'Plinganserstr. 12' and 'Plinganserstraße 12,' -> 'plinganserstraße'."""
-    s = re.split(r"\d", (l.street or "").lower())[0]
-    s = re.sub(r"[^a-zäöüß]", "", re.sub(r"str\.|strasse", "straße", s))
+    s = re.split(r"\d", _street(l).lower())[0]
+    s = re.sub(r"[^a-zäöüß]", "", re.sub(r"(strasse|str\.?)(?![a-zäöüß])", "straße", s))
     return s if len(s) > 4 else ""
 
 
@@ -300,12 +324,45 @@ def site_dry_run(site: Site) -> bool:
 
 
 def search_cfg(l: Listing):
-    """The search an ad came from: same site and kind, else the same kind on another site."""
-    same_kind = [sc for sc in CFG["search"]["searches"] if sc.get("kind", "room") == l.kind]
-    for sc in same_kind:
-        if site_for_url(sc["url"]).name == l.site:
-            return sc
-    return same_kind[0] if same_kind else {}
+    """The search whose limits apply to an ad: the one that found it, unless it turned out to be the other
+    kind and there's a search for that kind (same site first)."""
+    searches = CFG["search"]["searches"]
+    same_kind = [sc for sc in searches if sc.get("kind", "room") == l.kind]
+    on_site = [sc for sc in same_kind if site_for_url(sc["url"]).name == l.site]
+    found_by = [sc for sc in searches if l.search and sc["url"] == l.search]
+    best = [sc for sc in found_by if sc in same_kind] or on_site or same_kind or found_by
+    best = best or [sc for sc in searches if site_for_url(sc["url"]).name == l.site] or searches
+    return best[0] if best else {}
+
+
+def search_keys() -> list[str]:
+    """One name per search, for its counters: "wg-gesucht/room", and "wg-gesucht/room #2" for a second one."""
+    keys = []
+    for sc in CFG["search"]["searches"]:
+        key = base = f"{site_for_url(sc['url']).name}/{sc.get('kind', 'room')}"
+        n = 1
+        while key in keys:
+            n += 1
+            key = f"{base} #{n}"
+        keys.append(key)
+    return keys
+
+
+def seeded_searches() -> list[str]:
+    """Searches that have run before (URL and kind). Databases from before this list: the ones with ads."""
+    seeded = DB_.kv_get("seeded_searches")
+    if seeded is None:
+        seeded = [
+            seed_id(sc)
+            for sc in CFG["search"]["searches"]
+            if DB_.count_search(site_for_url(sc["url"]).name, sc.get("kind", "room"))
+        ]
+        DB_.kv_set("seeded_searches", seeded)
+    return seeded
+
+
+def seed_id(sc) -> str:
+    return f"{sc.get('kind', 'room')} {sc['url']}"
 
 
 def hard_filter(l: Listing, extra_text="") -> str | None:
@@ -411,6 +468,19 @@ def keyboard(lid, l: Listing | None = None):
     if l:
         rows.append(link_buttons(l))
     return InlineKeyboardMarkup(rows)
+
+
+def unsure_keyboard(lid, l: Listing, sent_at):
+    """After an unconfirmed send: sending again takes a deliberate tap on a button that says so.
+    The button carries the attempt's time, so a double tap can't send once more after the next attempt."""
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✅ It was sent", callback_data=f"sent:{lid}")],
+            [InlineKeyboardButton("🔁 Not sent: send again", callback_data=f"resend@{int(sent_at)}:{lid}")],
+            [InlineKeyboardButton("❌ Not sent: skip", callback_data=f"drop:{lid}")],
+            link_buttons(l),
+        ]
+    )
 
 
 def card_text(l: Listing, r, meta, with_translation=True):
@@ -622,10 +692,11 @@ def summary_text(hours=24):
         if r["status"] == "filtered":
             label = next((lbl for pat, lbl in FILTER_REASONS if re.search(pat, r["note"] or "")), "other")
             reasons[label] = reasons.get(label, 0) + 1
-    cards = [r for r in rows if r["status"] in ("pending", "sent", "skipped", "already", "replied")]
-    sent = DB_.c.execute("SELECT COUNT(*) FROM listings WHERE sent_at > ?", (since,)).fetchone()[0]
+    cards = [r for r in rows if r["status"] in ("pending", "skipped", *CONTACTED)]
+    sent = DB_.c.execute("SELECT COUNT(*) FROM listings WHERE sent_at > ? AND status<>'unsure'", (since,)).fetchone()[0]
     replies = DB_.c.execute("SELECT COUNT(*) FROM listings WHERE reply_at > ?", (since,)).fetchone()[0]
-    sent_all = len(DB_.sent_rows())
+    unsure = [r for r in DB_.sent_rows() if r["status"] == "unsure"]
+    sent_all = len(DB_.sent_rows()) - len(unsure)
     replied_all = DB_.c.execute("SELECT COUNT(*) FROM listings WHERE reply_at IS NOT NULL").fetchone()[0]
     waiting = DB_.c.execute("SELECT COUNT(*) FROM listings WHERE status='pending'").fetchone()[0]
     events = [ev for ev in DB_.kv_get("events", []) if ev["t"] > since]
@@ -646,6 +717,8 @@ def summary_text(hours=24):
         f"• 💬 Replies: {replies} (total {replied_all})",
         f"• ⏳ Cards waiting for your decision: {waiting}",
     ]
+    if unsure:
+        lines.append(f"• ❔ Unconfirmed sends waiting for your answer: {len(unsure)}")
     if by.get("stale") or by.get("error") or by.get("gone"):
         lines.append(
             f"• Not processed: {by.get('stale', 0)} too old in the queue, {by.get('error', 0)} errors, "
@@ -807,8 +880,13 @@ async def _poll(ctx, st):
     p = CFG["poll"]
     st["n"] += 1
     resting = set()  # sites that pushed back, ran out of budget or are cooling down: skipped this poll
-    due = [s for s in CFG["search"]["searches"] if (st["n"] - 1) % max(1, int(s.get("every_n_polls", 1))) == 0]
-    for i, sc in enumerate(due):
+    seeded = seeded_searches()
+    due = [
+        (key, s)
+        for key, s in zip(search_keys(), CFG["search"]["searches"], strict=True)
+        if (st["n"] - 1) % max(1, int(s.get("every_n_polls", 1))) == 0
+    ]
+    for i, (key, sc) in enumerate(due):
         site = site_for_url(sc["url"])
         if site.name in resting or site.guard.cooling_left():
             resting.add(site.name)
@@ -816,7 +894,6 @@ async def _poll(ctx, st):
         if i:
             await asyncio.sleep(random.uniform(8, 20))
         kind = sc.get("kind", "room")
-        key = f"{site.name}/{kind}"
         url = site.prepare_search_url(sc["url"], sc.get("max_rent"), sc.get("min_size", CFG["search"].get("min_size")))
         try:
             listings = await site.search(url, kind)
@@ -844,12 +921,17 @@ async def _poll(ctx, st):
         st["last_poll"] = datetime.now().strftime("%H:%M:%S")
 
         new = [l for l in listings if not DB_.seen(l.id)]
-        if not st["seeded"].get(key) and p.get("skip_existing_on_start") and DB_.count_search(site.name, kind) == 0:
+        for l in new:
+            l.search = sc["url"]
+        first_time = seed_id(sc) not in seeded
+        if first_time and p.get("skip_existing_on_start"):
             for l in new:
                 DB_.add(l, status="preexisting")
             log.info("marked %d existing %s listings as seen", len(new), key)
             new = []
-        st["seeded"][key] = True
+        if first_time:
+            seeded.append(seed_id(sc))
+            DB_.kv_set("seeded_searches", seeded)
         for l in new:
             DB_.add(l, status="queued")
             if why := hard_filter(l):  # cheap check on the card, no extra page load
@@ -965,7 +1047,7 @@ async def handle_conversation(bot, site: Site, c, sent, drafts, first_run) -> bo
             rows = [r for r in sent if r["id"] == ad_id] if ad_id else []
     preview = re.sub(r"\s+", " ", c["text"]).strip()[:300]
     # the first run only learns old chats, but a reply to an ad sent through the agent is news
-    if not first_run or (rows and rows[0]["status"] == "sent"):
+    if not first_run or (rows and rows[0]["status"] in ("sent", "unsure")):
         title = rows[0]["title"] if rows else c["title"]
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("💬 Open chat", url=c["href"])]])
         await bot.send_message(
@@ -992,6 +1074,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if q.message.chat_id != CFG["telegram"]["chat_id"]:
         return
     action, lid = q.data.split(":", 1)
+    action, _, attempt = action.partition("@")
     r = DB_.get(lid)
     if not r:
         await q.answer("Unknown listing")
@@ -1005,22 +1088,38 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except BadRequest:  # a double tap: the buttons are already gone
             pass
         return
-    if action == "skip":
-        DB_.update(lid, status="skipped")
+    stale = action == "resend" and attempt != str(int(r["sent_at"] or 0))
+    if r["status"] == "unsure" and (stale or action not in ("sent", "resend", "drop")):  # an older card or attempt
+        await q.answer("It may already have been sent. Check your inbox on the site first.", show_alert=True)
+        try:
+            await q.edit_message_reply_markup(unsure_keyboard(lid, l, r["sent_at"]))
+        except BadRequest:  # already showing
+            pass
+        return
+    if r["status"] != "unsure" and action in ("resend", "drop"):  # answered on another card: no second send
+        await q.answer("Already answered")
+        try:
+            await q.edit_message_reply_markup(keyboard(lid, l) if r["status"] == "pending" else links_keyboard(l))
+        except BadRequest:  # already showing
+            pass
+        return
+    if action in ("skip", "drop"):
+        DB_.update(lid, status="skipped", sent_at=None)
         await q.answer("Skipped")
         await q.edit_message_reply_markup(links_keyboard(l))
     elif action == "sent":  # sent by hand in the site's app
-        DB_.update(lid, status="sent", sent_at=time.time(), poster_id=l.poster_id or None)
+        when = r["sent_at"] if r["status"] == "unsure" else None  # the moment Send was clicked
+        DB_.update(lid, status="sent", sent_at=when or time.time(), poster_id=l.poster_id or None)
         await q.answer("Logged as sent")
         await q.edit_message_reply_markup(links_keyboard(l))
         try:
             write_excel(DB_.c, EXCEL)
         except Exception:
             log.exception("excel export failed")
-        await q.message.reply_text(
-            f"📤 Logged in the applications sheet (/excel). I can't read your {SITES[l.site].label} inbox, "
-            "so replies there won't show up here."
-        )
+        note = "📤 Logged in the applications sheet (/excel)."
+        if by_hand(l):
+            note += f" I can't read your {SITES[l.site].label} inbox, so replies there won't show up here."
+        await q.message.reply_text(note)
     elif action in ("edit", "rewrite"):
         await q.answer()
         ctx.user_data["pending"] = (action, lid)
@@ -1030,7 +1129,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             else "What should I change? (e.g. 'shorter', 'mention I can visit Saturday'). Send '.' for a fresh version."
         )
         await q.message.reply_text(prompt)
-    elif action == "send":
+    elif action in ("send", "resend"):
         if prev := DB_.same_person(l):
             await q.answer("Already contacted this person", show_alert=True)
             await q.message.reply_text(
@@ -1040,6 +1139,8 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             DB_.update(lid, status="same_person")
             await q.edit_message_reply_markup(links_keyboard(l))
             return
+        if action == "resend":  # you checked: the first attempt didn't go out
+            DB_.update(lid, status="pending", sent_at=None)
         await q.answer("Sending…")
         await q.edit_message_reply_markup(links_keyboard(l))  # no second ✅ while it sends; links stay
         site = SITES[l.site]
@@ -1060,14 +1161,17 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             log.exception("send failed")
             status, shot, info = "failed", None, f"Error: {e}"
-        if status in ("sent", "already"):
+        if status in ("sent", "already", "unsure"):
             DB_.update(lid, status=status, sent_at=time.time(), poster_id=l.poster_id or None)
             try:
                 write_excel(DB_.c, EXCEL)
             except Exception:
                 log.exception("excel export failed")
         caption = f"{info}\n{l.url}"
-        if status == "failed":
+        if status == "unsure":
+            caption = "❔ " + caption + "\nDid it go out? Check, then answer with the buttons on the card."
+            await q.message.edit_reply_markup(unsure_keyboard(lid, l, DB_.get(lid)["sent_at"]))
+        elif status == "failed":
             caption = "❌ " + caption + "\nThe draft is in the card above – you can copy it and send manually."
             await q.message.edit_reply_markup(keyboard(lid, l))
         elif status == "dry_run":  # keep the card usable: after switching dry_run off, ✅ sends it for real
@@ -1089,8 +1193,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     action, lid = pending
     r = DB_.get(lid)
-    if r["status"] in DONE:  # sent after you tapped Edit / Rewrite: keep the message that really went out
-        await update.message.reply_text("That ad has already been sent, so I left its message as it is.")
+    if r["status"] in CONTACTED:  # sent after you tapped Edit / Rewrite: keep the message that really went out
+        maybe = "may already have been sent" if r["status"] == "unsure" else "has already been sent"
+        await update.message.reply_text(f"That ad {maybe}, so I left its message as it is.")
         return
     text = update.message.text
     if action == "edit":
@@ -1214,7 +1319,7 @@ async def cmd_test(update: Update, ctx):
         await update.message.reply_text(str(e))
         return
     l = site.listing_from_url(ctx.args[0])
-    if (old := DB_.get(l.id)) and old["status"] in DONE:  # keep what was really sent
+    if (old := DB_.get(l.id)) and old["status"] in CONTACTED:  # keep what was really sent
         await update.message.reply_text(
             f"You already wrote to this ad (status: {old['status']}), so /test won't replace its draft and status."
         )
@@ -1232,9 +1337,7 @@ async def cmd_test(update: Update, ctx):
 # ---------------- main ----------------
 async def post_init(app: Application):
     await COMMUTE_.setup()  # Chromium starts on first use (the login check below, for the browser sites)
-    app.bot_data.update(
-        paused=False, fails={}, n=0, counts={}, zeros={}, seeded={}, budget_warned={}, poll_lock=asyncio.Lock()
-    )
+    app.bot_data.update(paused=False, fails={}, n=0, counts={}, zeros={}, budget_warned={}, poll_lock=asyncio.Lock())
     first = random.uniform(30, 90)
     app.job_queue.run_once(tick, first, name="poll", job_kwargs=RUN_LATE)
     if CFG.get("replies", {}).get("enabled", True):
@@ -1282,6 +1385,7 @@ def main():
     CFG["telegram"]["chat_id"] = int(CFG["telegram"]["chat_id"])
 
     DB_ = DB()
+    DB_.refresh_fingerprints()
     if a.login:
         setup_sites(headless=False, block_resources=False)
         browser_sites = {n: s for n, s in SITES.items() if not s.send_by_hand}

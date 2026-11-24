@@ -37,7 +37,7 @@ FILL = {
     "sent": PatternFill("solid", fgColor="FFF2CC"),
     "already": PatternFill("solid", fgColor="E7E6E6"),
 }
-STATUS_LABEL = {"sent": "sent", "replied": "replied", "already": "contacted before"}
+STATUS_LABEL = {"sent": "sent", "replied": "replied", "already": "contacted before", "unsure": "not confirmed"}
 COL = {name: i for i, (name, _) in enumerate(COLUMNS, 1)}
 
 
@@ -47,7 +47,7 @@ def _ts(t):
 
 def write_excel(conn, path="applications.xlsx") -> str:
     rows = conn.execute(
-        "SELECT * FROM listings WHERE status IN ('sent','replied','already') ORDER BY COALESCE(sent_at, created) DESC"
+        "SELECT * FROM listings WHERE status IN ('sent','replied','already','unsure') ORDER BY COALESCE(sent_at, created) DESC"
     ).fetchall()
     wb = Workbook()
     ws = wb.active

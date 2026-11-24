@@ -40,6 +40,7 @@ user sends from the app and taps 📤 I sent it). See README.md for the user-fac
   `/no_think`, key from config or `LLM_API_KEY`), the prompt, scam regexes, and full/template message modes.
 - `tracker.py`: `applications.xlsx` export and matching inbox conversations to sent ads.
 - State: `wg.sqlite` (listings with status queued/filtered/pending/sent/replied/..., plus a kv table).
+  `unsure` = Send was clicked but not confirmed (`Site._click_send`): never resend it without the user's answer.
 - Config: `config.yaml` (copy of `config.example.yaml`). The user's own facts live under `me:`.
 
 ## Rules for working on this

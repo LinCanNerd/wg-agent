@@ -4,7 +4,6 @@ Selectors are based on the 2026 markup (cross-checked with Fredy's fixtures, Fla
 MietRadar, nickirk/immo, jonasdieker & AykoSc bots).
 """
 
-import asyncio
 import logging
 import re
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -23,6 +22,16 @@ COORD_RE = re.compile(r'markers:\s*\[\s*\{\s*"lat"\s*:\s*([\d.]+)\s*,\s*"lng"\s*
 # Logged-out version of member pages (e.g. nachrichten.html) in 2026: same URL, no login form, just this text.
 LOGGED_OUT_WORDS = re.compile(r"bitte loggen sie sich hier ein|schön, dass sie vorbeischauen", re.I)
 INBOX_URL = BASE + "/nachrichten.html?filter_type=0"
+# My message in the conversation (not in the form), or the timestamp of a message I sent.
+SENT_JS = r"""
+(text) => {
+  const norm = (s) => s.replace(/\s+/g, ' ').trim();
+  const start = norm(text).slice(0, 60);
+  return !!document.querySelector('#message_timestamp') ||
+    [...document.querySelectorAll('.message_content, .conversation_message')]
+      .some(e => !e.querySelector('textarea') && e.tagName !== 'TEXTAREA' && norm(e.textContent).includes(start));
+}
+"""
 SECTION_NAMES = ["Zimmer", "Lage", "WG-Leben", "Sonstiges"]
 
 
@@ -374,35 +383,21 @@ class WGGesucht(Site):
             if not btn:
                 return "failed", await self._shot(page, "nobutton"), "Send button not found"
 
-            api_ok = asyncio.get_running_loop().create_future()
+            async def verdict(resp):
+                if "action=conversations" not in resp.url or resp.request.method != "POST":
+                    return None
+                if 400 <= resp.status < 500:
+                    return "failed"
+                return "sent" if resp.ok and "conversation_id" in await resp.text() else "unsure"
 
-            async def on_resp(resp):
-                if "action=conversations" in resp.url and not api_ok.done():
-                    try:
-                        body = await resp.text()
-                    except Exception:
-                        body = ""
-                    api_ok.set_result(resp.ok and "conversation_id" in body)
-
-            page.on("response", on_resp)
-            await btn.click(timeout=10000)
-            ok = False
-            try:
-                ok = await asyncio.wait_for(asyncio.shield(api_ok), timeout=12)
-            except asyncio.TimeoutError:
-                pass
-            if not ok:  # UI fallback: the sent message bubble / timestamp shows up
+            async def shown():  # the sent message itself, or the timestamp that wasn't there before
                 try:
-                    await page.wait_for_selector(
-                        "#message_timestamp, .message_content, .conversation_message", timeout=6000
-                    )
-                    ok = True
+                    await page.wait_for_function(SENT_JS, arg=text, timeout=6000)
+                    return True
                 except PWTimeout:
-                    pass
-            shot = await self._shot(page, "sent" if ok else "unsure")
-            if ok:
-                return "sent", shot, "Sent ✅"
-            return "failed", shot, "Clicked send but couldn't confirm – check the screenshot"
+                    return False
+
+            return await self._click_send(page, btn, verdict, shown)
 
     async def inbox(self) -> list[dict]:
         """Conversation list (1 page load)."""

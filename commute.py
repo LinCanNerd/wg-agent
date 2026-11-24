@@ -157,6 +157,8 @@ class Commute:
                 "numItineraries": 4,
             },
         )
+        if data is None:
+            return None  # request failed, which isn't the same as no route
         best = self._best_itinerary(data)
         if not best:
             return {}
@@ -195,10 +197,13 @@ class Commute:
             )
             try:
                 el = data["rows"][0]["elements"][0]
+                if el.get("status") in ("ZERO_RESULTS", "NOT_FOUND"):
+                    continue  # really no route
                 if el.get("status") != "OK":
-                    continue
+                    raise KeyError(el.get("status"))
                 mins = round(el["duration"]["value"] / 60)
             except (TypeError, KeyError, IndexError):
+                out.setdefault("failed", []).append("bike" if mode == "bicycling" else "transit")
                 continue
             if mode == "bicycling":
                 out["bike_min"] = mins
@@ -221,7 +226,7 @@ class Commute:
             return {}, "📍 no location in ad"
         # the key includes the destination settings, so moving a destination doesn't reuse stale times
         dest_sig = json.dumps([(d["name"], d["lat"], d["lng"], d.get("bike_to_station_minutes")) for d in self.dests])
-        cache_key = f"route:{round(lat, 4)},{round(lng, 4)}:{hashlib.sha1(dest_sig.encode()).hexdigest()[:8]}"
+        cache_key = f"route2:{round(lat, 4)},{round(lng, 4)}:{hashlib.sha1(dest_sig.encode()).hexdigest()[:8]}"
         cached = self.kv_get(cache_key, None)
         if cached and all(d["name"] in cached for d in self.dests):
             res = cached
@@ -234,19 +239,25 @@ class Commute:
                     r = await (self._google if self.provider == "google" else self._transitous)(lat, lng, d, when)
                 except Exception as e:
                     log.warning("routing failed: %s", e)
-                r = r or {}
+                if r is None:
+                    r = {"failed": ["bike", "transit"]}
                 if d.get("bike_to_station_minutes") and self.provider != "google":
+                    bt = None
                     try:
-                        r.update(await self._transitous_bike_train(lat, lng, d, when))
+                        bt = await self._transitous_bike_train(lat, lng, d, when)
                     except Exception as e:
                         log.warning("bike+train routing failed: %s", e)
+                    if bt is None:
+                        r.setdefault("failed", []).append("bike_train")
+                    else:
+                        r.update(bt)
                 km = haversine_km(lat, lng, d["lat"], d["lng"])
                 r["air_km"] = round(km, 1)
                 if "bike_min" not in r:  # rough estimate: detour factor 1.3 at 15 km/h
                     r["bike_min"] = round(km * 1.3 / 15 * 60 + 2)
                     r["estimated"] = True
                 res[d["name"]] = r
-            if not any(v.get("estimated") for v in res.values()):
+            if not any(v.get("estimated") or v.get("failed") for v in res.values()):
                 self.kv_set(cache_key, res)
         return res, self.summary(res)
 
@@ -287,6 +298,13 @@ class Commute:
             if not ok and r.get("estimated") and r.get("transit_min") is None:
                 # routing service unreachable: never exclude on a rough guess, let you decide
                 warn.append(f"route to {d['name']} not verified (≈{r.get('bike_min')} min by bike)")
+                continue
+            failed = r.get("failed") or []
+            if not ok and (
+                (mb is not None and "bike" in failed)
+                or (mt is not None and ("transit" in failed or "bike_train" in failed))
+            ):  # the time that's missing could have been within the limit
+                warn.append(f"route to {d['name']} only partly verified ({self.summary({d['name']: r})})")
                 continue
             if not ok:
                 msg = f"too far from {d['name']} ({self.summary({d['name']: r})})"
