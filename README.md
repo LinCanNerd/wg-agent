@@ -4,9 +4,9 @@
 
 A flat-hunting assistant that runs on your own machine. It watches your
 [WG-Gesucht](https://www.wg-gesucht.de), [Kleinanzeigen](https://www.kleinanzeigen.de) and
-[ImmoScout24](https://www.immobilienscout24.de) searches, uses an
-**LLM** (on your own machine or a cloud API) to score each new ad and write a personal first message in
-the ad's language, and sends you a card in **Telegram**. **Nothing is ever sent until you tap ✅.**
+[ImmoScout24](https://www.immobilienscout24.de) searches, uses an **LLM** (local or cloud) to score each
+new ad and draft a personal first message in German or English, and sends you a card in **Telegram**.
+**Nothing is ever sent until you tap ✅.**
 
 > **Disclaimer:** this is an unofficial personal tool, not affiliated with WG-Gesucht, Kleinanzeigen or ImmoScout24.
 > Automated access may be against the sites' terms of use. Use it at your own risk, keep the request volume
@@ -14,45 +14,24 @@ the ad's language, and sends you a card in **Telegram**. **Nothing is ever sent 
 
 ## Features
 
-- **Fast:** checks your searches every 2–3.5 minutes. With WG-Gesucht Plus, logged in, you also get
-  Plus's head start on new ads.
-- **Three sites:** WG-Gesucht, Kleinanzeigen's "Auf Zeit & WG" and "Mietwohnungen" categories, and
-  ImmoScout24's flats and WG rooms. Each site has its own page budget, so one site pushing back doesn't
-  stop the others. Immowelt isn't supported: it shows a captcha right away.
-- **ImmoScout24 is read-only:** its website blocks automated browsers on the first page, so the agent reads
-  ImmoScout24 through the API its app uses, as [Fredy](https://github.com/orangecoding/fredy) does. It
-  can't send there: you copy the draft, send it from the ImmoScout24 app and tap `📤 I sent it`, which
-  logs it in `applications.xlsx`. Many new private ads take messages only from ImmoScout24 Plus members
-  for their first days; the card shows until when (🔒).
-- **Cheap filtering first:** paid, partner and company ads, swap offers (Tauschangebote), old ads,
-  ads over budget and ads for the other gender only are dropped from the search page, without opening them.
-- **Reads the whole ad:** all description tabs (where code words hide), exact coordinates,
-  flatmates, who they're looking for, the advertiser's "member since" date and, with Plus, the number
-  of applicants.
-- **Real commute times** by bike and public transport to the places you choose, via the free
-  [Transitous](https://transitous.org) routing service (Google Distance Matrix is optional).
-  Ads that are too far away are dropped or flagged.
-- **No double messages:** skips reposts of the same flat, the same flat advertised on the other site
-  (same text, or same street, size and rent), and advertisers you've already written to.
-- **LLM drafting:** scores the ad 0–10, spots scam signals and code words ("start your message with
-  *Banane*"), answers questions the ad asks, and writes the message in German or English: casual
-  "du" for WGs, polite "Sie" for studios. By default it sends your own fixed text and only adds a
-  sentence about the ad. German drafts come with an English translation for you.
-- **Trap check:** a plain text search (not the model) finds tests hidden in the ad ("schreib das Wort
-  *Brezel* in deine Nachricht", "write X in the subject line") and shows them on the card, so a test
-  the model overlooks still reaches you. The code word goes into a natural sentence; if it must come
-  first, the message really starts with it, a greeting-style one ("Moin Moin") becomes the greeting, and
-  a subject-line one goes alone on the first line. The card checks all of this again before you send.
-- **Telegram approval:** photo album + card with commute, flatmates, score, warnings, notes and the
-  draft. Buttons: `✅ Send` `❌ Skip` `✏️ Edit` `🔁 Rewrite` `🔗 Ad` `🗺 Map` `🚲 Route`
-  (`📤 I sent it` instead of `✅ Send` on ImmoScout24).
-- **Safe sending:** goes straight to the contact form, refuses if you already wrote to that ad or
-  person, and confirms the message actually went out. Sending on Kleinanzeigen stays a dry run until
-  you switch it on (`sites.kleinanzeigen.dry_run`), because it hasn't been verified on the live site yet.
-- **Reply tracking:** checks your WG-Gesucht and Kleinanzeigen inboxes, pings you in Telegram when someone
-  answers, and keeps an `applications.xlsx` log of everything you sent (`/excel`).
-- **For friends too:** run one agent per person on the same machine, each with their own profile, searches
-  and Telegram bot. See [Several people on one machine](#several-people-on-one-machine).
+- **Filters first:** company ads, swap offers, old, too expensive or unsuitable ads are dropped before they're opened.
+- **Reads the whole ad:** all description tabs, coordinates, flatmates, and, with WG-Gesucht Plus, the applicant count.
+- **Real commute times** by bike and public transport, via the free [Transitous](https://transitous.org) service
+  (or Google).
+- **Drafts:** a 0–10 score, scam signals, answers to the ad's questions, and an English translation of German
+  drafts. By default your own fixed text is sent, plus one sentence about the ad.
+- **Code words:** finds tests hidden in the ad ("write *Banane* in your message"), puts them in the message
+  and checks again before you send.
+- **No double messages:** skips reposts, the same flat on another site, and people you've already written to.
+- **Reply tracking:** pings you when someone answers (WG-Gesucht, Kleinanzeigen) and logs everything in `applications.xlsx`.
+
+| Site | Reads | Sends |
+|---|---|---|
+| WG-Gesucht | website, logged in | after you tap ✅ |
+| Kleinanzeigen | website, logged in | after you tap ✅; a dry run until you set `sites.kleinanzeigen.dry_run: false`, because sending isn't verified live yet |
+| ImmoScout24 | app API, no login | never: copy the draft, send it from the app, tap `📤 I sent it`. 🔒 on a card means only Plus members can write for now |
+
+Immowelt isn't supported (captcha on the first page).
 
 ## How it works
 
@@ -64,30 +43,11 @@ search page ──► card filter ──► ad page ──► filters, repost & 
           you tap ✅ ──► the site's contact form ──► applications.xlsx ◄── inbox replies
 ```
 
-| File | What it does |
-|---|---|
-| `bot.py` | Telegram bot, main loop, filters, SQLite storage |
-| `sites.py` | What all sites share: one persistent, logged-in Chromium (Playwright) and the `Site` interface |
-| `wg.py` | WG-Gesucht: search, ad page, contact form and inbox selectors |
-| `kleinanzeigen.py` | Kleinanzeigen: search, ad page (both 2026 layouts), contact form and inbox |
-| `immoscout.py` | ImmoScout24: search and ad details through the app's API (read-only) |
-| `llm.py` | Prompt, scoring, drafting, scam signals (any OpenAI-compatible API) |
-| `commute.py` | Bike and public transport times via Transitous / Nominatim (or Google) |
-| `guard.py` | Request budget and block cooldowns per site, saved across restarts |
-| `tracker.py` | `applications.xlsx` export and matching inbox replies to sent ads |
-
-## Requirements
-
-- An always-on computer with Python 3.10+ (Linux or macOS): a home server, a Raspberry Pi-class
-  board or a small VPS. It runs the Telegram bot and a headless Chromium; no GPU is needed if you
-  use a cloud LLM.
-- An LLM: a local one or a cloud API key. See [Choosing an LLM](#choosing-an-llm).
-- A Telegram bot token (from [@BotFather](https://t.me/BotFather)) and your Telegram user id
-  (from [@userinfobot](https://t.me/userinfobot)).
-- A WG-Gesucht account (Plus is optional but helps), and a Kleinanzeigen account if you search there.
-  ImmoScout24 needs no login here: you send from its app, with your own account.
-
 ## Setup
+
+You need an always-on Linux or macOS computer with Python 3.10+, an [LLM](#choosing-an-llm), a Telegram bot
+token (from [@BotFather](https://t.me/BotFather)), your Telegram user id (from
+[@userinfobot](https://t.me/userinfobot)), and an account on each site you search.
 
 ```bash
 git clone <this repo> wg-agent && cd wg-agent
@@ -100,112 +60,53 @@ python bot.py --login                       # once: opens a browser window, log 
 python bot.py
 ```
 
-In Telegram, open your bot and press **Start**. `--login` needs a display; on a headless server use
-`ssh -X` or VNC. `python bot.py --login kleinanzeigen` logs in to one site only. If you only search
-ImmoScout24, skip `--login`: the agent then never starts a browser.
+In Telegram, open your bot and press **Start**. `--login` needs a display (`ssh -X` or VNC on a headless
+server); skip it if you only search ImmoScout24.
+
+**Test first:** keep `send.dry_run: true` and send `/test <ad url>` for a few ads. ✅ then fills in the contact
+form and sends you a screenshot instead of sending. When you're happy, set `dry_run: false`.
 
 ## Choosing an LLM
 
-The agent talks to any OpenAI-compatible chat API, so you set `llm.base_url`, `llm.model` and, for
-cloud providers, `llm.api_key` (or the `LLM_API_KEY` environment variable). `config.example.yaml`
-lists the URLs.
+Any OpenAI-compatible API works: set `llm.base_url`, `llm.model` and, for cloud providers, `llm.api_key` (or
+`LLM_API_KEY`). `config.example.yaml` lists the URLs.
 
-| | Local | Cloud |
+| | Local (Ollama, LM Studio, vLLM) | Cloud (OpenAI, Anthropic, Gemini, ...) |
 |---|---|---|
-| Examples | Ollama, LM Studio, vLLM | OpenAI, Anthropic, Google Gemini, Mistral, Groq, OpenRouter |
 | Hardware | A strong GPU or Apple Silicon | None beyond the always-on computer |
-| Cost | Free | Pay per use (one or two requests per ad you see) |
-| Privacy | Everything stays on your machine | Your profile and the ads are sent to the provider |
+| Cost | Free | One or two requests per ad |
+| Privacy | Stays on your machine | Your profile and the ads go to the provider |
 
-German quality matters more than speed, because you read every draft anyway. Local results from our
-tests: `gemma4:31b` wrote the best German; `gemma4:26b` and `qwen3:30b-a3b-instruct-2507` are much
-faster with a few slips; small 8B models tend to invent facts about you. With Ollama, run
-`ollama pull <model>` first.
-Whatever you pick, try it with `/test` before turning off dry run.
+In our tests `gemma4:31b` wrote the best German; `gemma4:26b` and `qwen3:30b-a3b-instruct-2507` are much faster
+with a few slips; 8B models tend to invent facts about you.
 
 ## Configuration
 
-Everything lives in `config.yaml`; `config.example.yaml` documents every option. The most important parts:
+Everything is in `config.yaml`; `config.example.yaml` documents every option. The main parts:
 
-- **`me:`** is who you are. The model only uses facts written here, so be complete and honest. If an
-  ad asks something your profile doesn't answer (smoker? pets?), the model may guess.
-  `preferences` tells it how to score; `message_guidelines` tells it how to write.
-- **`search.searches`:** one entry per search URL (WG-Gesucht, Kleinanzeigen or ImmoScout24), each with its
-  own budget and minimum score. For ImmoScout24, set your filters on its website and paste the URL.
-- **`sites:`** per-site settings: `dry_run` and that site's own page budget, and `sites.immoscout.plus`
-  if you have ImmoScout24 Plus.
-- **`commute.destinations`:** the places you travel to, with limits. `action: exclude` drops ads that
-  are too far; `mark` only adds a warning.
-- **`me.mode`:**
-  - `template` (what `config.example.yaml` uses): your own fixed text (`me.templates`, one per WG/studio and German/English)
-    is sent word for word. The model only fills in the greeting and one plain sentence about the ad,
-    plus answers to questions the ad asks and a code word if there is one. It sees your text so it
-    doesn't repeat it, and sentences where it invents where you live are dropped.
-  - `full`: the model writes the whole message, following `message_guidelines`. More varied, but it
-    tends to sound like an AI.
-  In both modes a code word found in the ad is always kept; a greeting-style one ("Servus zusammen!")
-  replaces the greeting.
-- **Other cities:** set `city`, use that city's search URLs, and adjust `districts_exclude` and
-  `commute.viewbox`.
-
-## First test
-
-Keep `send.dry_run: true` and send `/test <ad url>` for a few ads. Pressing ✅ then fills in the
-contact form and sends you a screenshot instead of sending. When you're happy with the drafts, set
-`dry_run: false`. Kleinanzeigen has its own switch, `sites.kleinanzeigen.dry_run`: check a dry-run
-screenshot there first.
-
-## Several people on one machine
-
-Friends looking too? Run one agent per person. Each person gets a folder with their own `config.yaml`
-(profile, templates, searches, commute) and their own Telegram bot from @BotFather, and the agent keeps
-that person's database, spreadsheet and browser login in that folder. They all share the code and the LLM.
-
-```bash
-mkdir -p ~/wg-agent-people/anna
-cp ~/wg-agent/config.example.yaml ~/wg-agent-people/anna/config.yaml   # fill it in for Anna
-cd ~/wg-agent-people/anna && ~/wg-agent/.venv/bin/python ~/wg-agent/bot.py
-```
-
-As a service, `wg-agent@.service` runs the agent in `~/wg-agent-people/<name>`:
-`systemctl --user enable --now wg-agent@anna` (see the comments in the file).
-
-Someone who only searches ImmoScout24 needs no `--login` and no browser; they send from their own
-ImmoScout24 app. For WG-Gesucht or Kleinanzeigen they log in with their own account, from their folder
-(`~/wg-agent/.venv/bin/python ~/wg-agent/bot.py --login`). Every agent has its own page budget, but they
-all come from your IP address: with several people, check each site less often (`every_n_polls: 2` or more).
+- **`me`:** who you are. The model only uses facts written here, so be complete and honest; if an ad asks
+  something your profile doesn't answer, it may guess. With `mode: template` your own text is sent word for word, with a greeting
+  and one sentence about the ad filled in; with `full` the model writes everything.
+- **`search.searches`:** one entry per search URL, each with its own budget and minimum score.
+- **`commute.destinations`:** places you travel to, with limits. `action: exclude` drops ads that are too far,
+  `mark` only warns.
+- **Another city:** set `city`, use its search URLs, and adjust `districts_exclude` and `commute.viewbox`.
 
 ## Telegram commands
 
 | Command | |
 |---|---|
 | `/status` | what the agent is doing, page budget, database counts |
-| `/check` | check the searches now |
-| `/replies` | check the inboxes now |
-| `/excel` | get `applications.xlsx` |
-| `/pause`, `/resume` | stop / restart polling |
+| `/check`, `/replies` | check the searches / inboxes now |
 | `/test <url>` | score and draft any ad (ignores filters) |
-| `/login_check` | is the browser still logged in to each site? |
+| `/excel` | get `applications.xlsx` |
 | `/summary` | the daily review right now |
-
-## Staying polite to the sites
-
-`guard.py` makes sure the agent stays well below anything that looks like scraping:
-
-- Every page load (on ImmoScout24, every API request) counts against that site's budget of 40 per hour
-  and 650 per day, saved to disk so restarts don't reset it. Normal use is about 30 per hour per site.
-- Searches run at random intervals (2–3.5 min, every ~20 min at night). At most 3 ads are opened per
-  check, freshest first.
-- A captcha, HTTP 403/429/503, the terms-of-use block page, or a search that suddenly comes back empty
-  pauses that site for 15 min, then 1 h, 3 h and 12 h for repeat blocks, and you get a Telegram note.
-  There is no captcha solving and no anti-detection stealth.
-- Images and fonts are never downloaded; Telegram fetches the photos itself.
-- Routing requests (Transitous / OpenStreetMap) are throttled to 1 per second and cached.
+| `/pause`, `/resume` | stop / restart polling |
+| `/login_check` | is the browser still logged in to each site? |
 
 ## Run it as a service
 
-`wg-agent.service` is a systemd **user** unit (no root needed). It assumes the repo is in `~/wg-agent`;
-edit the paths if not.
+`wg-agent.service` is a systemd **user** unit. It assumes the repo is in `~/wg-agent`; edit the paths if not.
 
 ```bash
 mkdir -p ~/.config/systemd/user && cp wg-agent.service ~/.config/systemd/user/
@@ -214,39 +115,47 @@ sudo loginctl enable-linger "$USER"    # keep it running after you log out
 journalctl --user -u wg-agent -f
 ```
 
+### Several people on one machine
+
+Give each person a folder with their own `config.yaml` and Telegram bot; their database, spreadsheet and
+logins stay in that folder.
+
+```bash
+mkdir -p ~/wg-agent-people/anna
+cp ~/wg-agent/config.example.yaml ~/wg-agent-people/anna/config.yaml   # fill it in for Anna
+cd ~/wg-agent-people/anna && ~/wg-agent/.venv/bin/python ~/wg-agent/bot.py --login   # with Anna's accounts
+cd ~/wg-agent-people/anna && ~/wg-agent/.venv/bin/python ~/wg-agent/bot.py
+```
+
+As a service: `systemctl --user enable --now wg-agent@anna` (setup is in the comments of `wg-agent@.service`).
+All agents share your IP address, so check each site less often (`every_n_polls: 2` or more).
+
+## Staying polite to the sites
+
+- Each site has its own budget of 40 page loads per hour and 650 per day, kept across restarts.
+- Searches run every 2–3.5 min (every ~20 min at night) and open at most 3 ads per check.
+- A captcha, HTTP 403/429/503, block page or suddenly empty search pauses that site for 15 min, then 1, 3 and
+  12 h, and you get a Telegram note. No captcha solving, no anti-detection stealth.
+
 ## Troubleshooting
 
-- **0 listings parsed / nothing found:** the sites change their HTML now and then. The selectors are
-  in `wg.py` and `kleinanzeigen.py` (`CARDS_JS`, `DETAIL_JS`, `INBOX_JS`, `send_message`).
-- **ImmoScout24 stops answering:** the agent pauses that site and tells you. If it keeps happening, the
-  API may want a newer app version: set `sites.immoscout.user_agent`.
-- **Logged out:** WG-Gesucht needs a session-only cookie; the agent saves it in `browser-session.json`
-  and restores it on start. If the server-side session expires, run `python bot.py --login` again
-  (or `--login kleinanzeigen` for just that site).
-- **Send problems:** a screenshot of every send attempt lands in `screenshots/`.
-- **Commute missing:** check the destination coordinates logged at startup, or set `lat`/`lng` yourself.
+- **Nothing found:** the sites change their HTML now and then. The selectors are in `wg.py` and `kleinanzeigen.py`.
+- **ImmoScout24 keeps failing:** the API may want a newer app version; set `sites.immoscout.user_agent`.
+- **Logged out:** run `python bot.py --login` again (`--login kleinanzeigen` for just that site).
+- **Send problems:** every send attempt leaves a screenshot in `screenshots/`.
+- **Commute missing:** check the coordinates logged at startup, or set `lat`/`lng` yourself.
 
 ## Privacy
 
-Your `config.yaml`, the browser profile and session, the database, the spreadsheet and the screenshots
-are personal and are all in `.gitignore`. Don't commit them. With a local LLM nothing leaves your machine
-except the requests to the flat sites, Telegram and the routing service; with a cloud LLM, your `me:` profile and the text
-of each ad are also sent to that provider.
+Your config, browser profile and session, database, spreadsheet and screenshots are personal and in
+`.gitignore`; don't commit them. With a local LLM, nothing leaves your machine except requests to the flat
+sites, Telegram and the routing service. With a cloud LLM, your `me:` profile and the ads also go to the provider.
 
 ## Credits
 
-Ideas and selectors borrowed from other open-source WG-Gesucht and flat-hunting projects:
-
-- **[Fredy](https://github.com/orangecoding/fredy):** current page markup, skipping paid cards,
-  coordinates from the map, Transitous commute and its etiquette, repost fingerprints, scam signals,
-  ImmoScout24 through its app's API.
-- **[Flathunter](https://github.com/flathunters/flathunter):** commute filtering, photo-first Telegram cards.
-- **MietRadar:** reading all description tabs, embedded-question prompts, template mode, inbox reply
-  tracking, visible-captcha detection.
-- **jonasdieker, AykoSc, nickirk/immo:** the `#message_timestamp` "already contacted" check,
-  send-form selectors, removing overlays.
-- **isaksolheim/gesucht:** handling code words.
-- **Lauchturm:** WG-Gesucht's terms-of-use block page as a block signal.
+Ideas and selectors borrowed from [Fredy](https://github.com/orangecoding/fredy),
+[Flathunter](https://github.com/flathunters/flathunter), MietRadar, jonasdieker, AykoSc, nickirk/immo,
+isaksolheim/gesucht and Lauchturm.
 
 ## License
 
