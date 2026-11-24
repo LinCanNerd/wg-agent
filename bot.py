@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo
 import yaml
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from commute import Commute
@@ -42,6 +43,11 @@ log = logging.getLogger("agent")
 CFG: dict = {}
 SITE_TYPES = (WGGesucht, Kleinanzeigen, ImmoScout)
 SITES: dict[str, Site] = {}  # every supported site; only the ones with a search are polled
+DONE = ("sent", "replied", "already")  # written to: never overwrite these rows' status or draft
+RETRY_MINUTES = (10, 30, 60, 120)  # waits after a failure (LLM down, network...) before an ad is given up on
+# A one-shot job that is more than 1 s late (stalled loop, laptop asleep) is dropped by default, and the
+# self-scheduling loops would never run again: run it late instead.
+RUN_LATE = {"misfire_grace_time": None}
 
 
 # ---------------- storage ----------------
@@ -63,6 +69,8 @@ class DB:
             "conv_url TEXT",
             "poster_id TEXT",
             "site TEXT",  # NULL in rows from before Kleinanzeigen: WG-Gesucht
+            "tries INTEGER",  # failed attempts so far
+            "retry_at REAL",  # queued: not before this time; pending: the card still has to be posted
         ):
             try:
                 self.c.execute(f"ALTER TABLE listings ADD COLUMN {col}")
@@ -102,7 +110,7 @@ class DB:
         rows = [
             r
             for r in self.c.execute("SELECT * FROM listings WHERE status='queued'")
-            if (r["site"] or "wg-gesucht") not in skip_sites
+            if (r["site"] or "wg-gesucht") not in skip_sites and (r["retry_at"] or 0) <= now
         ]
 
         def age(r):  # the site's "Online: x min" when we saw the card, plus the time since; ids aren't chronological
@@ -111,6 +119,21 @@ class DB:
 
         rows.sort(key=age)
         return rows[:n]
+
+    def retry_later(self, lid, status="queued") -> bool:
+        """Try this ad again later; False (and status 'error') once it has failed too often."""
+        tries = self.get(lid)["tries"] or 0
+        if tries >= len(RETRY_MINUTES):
+            self.update(lid, status="error", retry_at=None)
+            return False
+        self.update(lid, status=status, tries=tries + 1, retry_at=time.time() + RETRY_MINUTES[tries] * 60)
+        return True
+
+    def unposted(self):
+        """Scored ads whose card couldn't be sent to Telegram, due for another attempt."""
+        return self.c.execute(
+            "SELECT id FROM listings WHERE status='pending' AND retry_at <= ?", (time.time(),)
+        ).fetchall()
 
     def expire_queue(self, hours):
         self.c.execute(
@@ -305,18 +328,22 @@ def hard_filter(l: Listing, extra_text="") -> str | None:
     inc = s.get("districts_include") or []
     if inc and not any(d.lower() in loc for d in inc):
         return f"district '{l.district}'"
+    # Excluding goes by the place itself and whole words: "Ismaninger Straße" isn't Ismaning, "Haartrockner" isn't Haar
+    place = f"{l.district} {l.address}".lower()
+    if not place.strip():
+        place = loc
     for d in s.get("districts_exclude") or []:
-        if d.lower() in loc:
+        if re.search(re.escape(d.lower()) + r"(?!\w)", place):
             return f"district '{d}'"
     g = (CFG["me"].get("gender") or "").lower()
     w = (l.wanted or "").lower()
     if l.kind == "room" and g in ("m", "w"):
         only_f = re.search(
-            r"(^|[;,]\s*)mitbewohnerin gesucht|^frau(en)? |nur (für )?frauen|female only|only (girls|women|female)",
+            r"(^|[;,]\s*)mitbewohnerin gesucht|^frau(en)? |nur (für )?frauen|\bfemale only|\bonly (girls|women|females?)\b",
             w + " " + hay,
         )
         only_m = re.search(
-            r"(^|[;,]\s*)mitbewohner gesucht|^mann |^männer |nur (für )?männer|male only|only (guys|men|male)",
+            r"(^|[;,]\s*)mitbewohner gesucht|^mann |^männer |nur (für )?männer|\bmale only|\bonly (guys|men|males?)\b",
             w + " " + hay,
         )
         if g == "m" and only_f and "oder" not in w:
@@ -513,14 +540,33 @@ async def post_card(bot, lid, with_photo=True):
         reply_to_message_id=reply_to,
     )
     if separate:
-        await bot.send_message(
-            chat,
-            f"<b>🇬🇧 In English (just for you, not sent):</b>\n"
-            f"<blockquote expandable>{html.escape(meta['translation'][:3500])}</blockquote>",
-            parse_mode=ParseMode.HTML,
-            reply_to_message_id=card.message_id,
-            disable_notification=True,
-        )
+        try:
+            await bot.send_message(
+                chat,
+                f"<b>🇬🇧 In English (just for you, not sent):</b>\n"
+                f"<blockquote expandable>{html.escape(meta['translation'][:3500])}</blockquote>",
+                parse_mode=ParseMode.HTML,
+                reply_to_message_id=card.message_id,
+                disable_notification=True,
+            )
+        except Exception:  # the card itself is out: don't post it again over this
+            log.exception("sending the translation failed")
+
+
+async def show_card(bot, lid):
+    """Post a new card; if Telegram can't be reached, try again later without scoring the ad again."""
+    try:
+        await post_card(bot, lid)
+    except Exception as e:
+        log.exception("posting the card failed")
+        if isinstance(e, BadRequest):  # Telegram refuses this card: the next attempt would fail the same way
+            DB_.update(lid, status="error", retry_at=None)
+        elif DB_.retry_later(lid, status="pending"):
+            return
+        r = DB_.get(lid)
+        await notify(bot, f"⚠️ Couldn't show the card for an ad scored {r['score']}/10: {r['url']}", important=True)
+        return
+    DB_.update(lid, retry_at=None)
 
 
 async def english_version(text, keyword=""):
@@ -622,7 +668,8 @@ async def daily_summary(ctx: ContextTypes.DEFAULT_TYPE):
 async def process(bot, l: Listing, force=False):
     """Details -> filters -> commute -> LLM -> Telegram card. force=True skips filters (for /test)."""
     try:
-        await SITES[l.site].fetch_details(l)
+        if force or not l.description:  # a retry already has the details: no second page load
+            await SITES[l.site].fetch_details(l)
     except LookupError as e:
         DB_.update(l.id, status="gone", note=str(e))
         if force:
@@ -668,8 +715,12 @@ async def process(bot, l: Listing, force=False):
         out = await LLM_.evaluate(l, lang, COMMUTE_.prompt_text(res))
     except Exception as e:
         log.exception("LLM failed")
+        first = not (DB_.get(l.id)["tries"] or 0)
         DB_.update(l.id, status="error", note=str(e)[:500])
-        await notify(bot, f"⚠️ New ad but drafting failed ({e.__class__.__name__}): {l.url}")
+        again = not force and DB_.retry_later(l.id)
+        if first or not again:  # not on every attempt in between
+            then = "I'll try again" if again else "giving up on it" if not force else "try /test again later"
+            await notify(bot, f"⚠️ New ad but drafting failed ({e.__class__.__name__}), {then}: {l.url}")
         return
     if out.get("commute_ok") is False and res:
         warnings.append("the model thinks the commute isn't feasible")
@@ -683,8 +734,11 @@ async def process(bot, l: Listing, force=False):
         log.info("low score %s: %s (%s)", l.id, out["score"], out["reasons"])
         return
     meta["translation"] = await english_version(out["message"], meta.get("keyword"))  # only for ads you'll see
-    DB_.update(l.id, status="pending", note=json.dumps(meta))
-    await post_card(bot, l.id)
+    DB_.update(l.id, status="pending", note=json.dumps(meta), retry_at=None)
+    if force:
+        await post_card(bot, l.id)  # /test reports a failure itself
+    else:
+        await show_card(bot, l.id)
 
 
 def next_delay():
@@ -706,7 +760,7 @@ async def tick(ctx: ContextTypes.DEFAULT_TYPE):
     except Exception:
         log.exception("poll crashed")
     finally:
-        ctx.job_queue.run_once(tick, next_delay(), name="poll")
+        ctx.job_queue.run_once(tick, next_delay(), name="poll", job_kwargs=RUN_LATE)
 
 
 async def on_block(bot, site: Site, why):
@@ -801,6 +855,9 @@ async def _poll(ctx, st):
             if why := hard_filter(l):  # cheap check on the card, no extra page load
                 DB_.update(l.id, status="filtered", note=why)
 
+    for r in DB_.unposted():
+        await show_card(ctx.bot, r["id"])
+
     # Open at most N ads per poll (freshest first); the rest wait for the next poll.
     DB_.expire_queue(hours=24)
     resting.update(s.name for s in SITES.values() if s.guard.cooling_left())
@@ -818,7 +875,8 @@ async def _poll(ctx, st):
                 resting.add(site.name)
                 continue
             log.exception("process failed")
-            DB_.update(l.id, status="error", note=str(e)[:500])
+            DB_.update(l.id, note=str(e)[:500])
+            DB_.retry_later(l.id)
 
 
 # ---------------- replies ----------------
@@ -831,7 +889,7 @@ async def inbox_tick(ctx: ContextTypes.DEFAULT_TYPE):
         r = CFG.get("replies", {})
         n0, n1 = CFG["poll"].get("night_hours", [1, 7])
         mins = r.get("night_check_minutes", 60) if n0 <= datetime.now().hour < n1 else r.get("check_minutes", 12)
-        ctx.job_queue.run_once(inbox_tick, mins * 60 + random.uniform(0, 120), name="inbox")
+        ctx.job_queue.run_once(inbox_tick, mins * 60 + random.uniform(0, 120), name="inbox", job_kwargs=RUN_LATE)
 
 
 async def check_replies(bot):
@@ -869,34 +927,45 @@ async def check_site_replies(bot, site: Site, sent):
     names.update(c["name"] for c in convs if c.get("name"))
     DB_.kv_set("inbox_names", sorted(names))
     drafts = [r["draft"] or "" for r in sent]
-    changed = False
-    for c in convs:
-        key = c["key"]
-        sig = f"{c['when']}|{c['text'][-200:]}"
-        if DB_.kv_get(key) == sig:
-            continue
-        DB_.kv_set(key, sig)
-        mine = c.get("mine")
-        if mine or (mine is None and looks_like_mine(c["text"], drafts)):
-            continue  # the newest message in that chat is my own
-        if c.get("ad_id"):  # the site says which ad the chat is about
-            rows = [r for r in sent if r["id"] == c["ad_id"]]
-        else:
-            rows = match_conversation(c, sent)
-            if len(rows) != 1:  # ambiguous / unknown: open the chat once to read the ad id
-                ad_id = await site.conversation_ad_id(c["href"])
-                rows = [r for r in sent if r["id"] == ad_id] if ad_id else []
-        preview = re.sub(r"\s+", " ", c["text"]).strip()[:300]
-        if rows:
-            r = rows[0]
-            if r["status"] != "replied":
-                DB_.update(r["id"], status="replied", reply_at=time.time(), reply_text=preview, conv_url=c["href"])
-                changed = True
-            else:
-                DB_.update(r["id"], reply_text=preview, conv_url=c["href"])
-                changed = True
-        if first_run:
-            continue  # first run only learns what's already there
+    changed, failed = False, 0
+    try:
+        for c in convs:
+            sig = f"{c['when']}|{c['text'][-200:]}"
+            if DB_.kv_get(c["key"]) == sig:
+                continue
+            try:
+                changed |= await handle_conversation(bot, site, c, sent, drafts, first_run)
+            except (Blocked, BudgetExceeded, CoolingDown):
+                raise  # the site sits out; this and the remaining chats are read at the next check
+            except Exception:
+                log.exception("handling a %s conversation failed", site.label)
+                failed += 1
+                continue
+            DB_.kv_set(c["key"], sig)  # only now: a reply you weren't told about must come up again
+    finally:
+        if changed:
+            write_excel(DB_.c, EXCEL)
+    if failed:
+        raise RuntimeError(f"{failed} conversation(s) failed, trying again at the next check")
+    if first_run:
+        DB_.kv_set(baseline, True)
+
+
+async def handle_conversation(bot, site: Site, c, sent, drafts, first_run) -> bool:
+    """One new or changed chat: log and announce a reply. True if it changed the applications sheet."""
+    mine = c.get("mine")
+    if mine or (mine is None and looks_like_mine(c["text"], drafts)):
+        return False  # the newest message in that chat is my own
+    if c.get("ad_id"):  # the site says which ad the chat is about
+        rows = [r for r in sent if r["id"] == c["ad_id"]]
+    else:
+        rows = match_conversation(c, sent)
+        if len(rows) != 1:  # ambiguous / unknown: open the chat once to read the ad id
+            ad_id = await site.conversation_ad_id(c["href"])
+            rows = [r for r in sent if r["id"] == ad_id] if ad_id else []
+    preview = re.sub(r"\s+", " ", c["text"]).strip()[:300]
+    # the first run only learns old chats, but a reply to an ad sent through the agent is news
+    if not first_run or (rows and rows[0]["status"] == "sent"):
         title = rows[0]["title"] if rows else c["title"]
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("💬 Open chat", url=c["href"])]])
         await bot.send_message(
@@ -907,10 +976,10 @@ async def check_site_replies(bot, site: Site, sent):
             reply_markup=kb,
             disable_web_page_preview=True,
         )
-    if first_run:
-        DB_.kv_set(baseline, True)
-    if changed:
-        write_excel(DB_.c, EXCEL)
+    if rows:
+        new = {} if rows[0]["status"] == "replied" else {"status": "replied", "reply_at": time.time()}
+        DB_.update(rows[0]["id"], reply_text=preview, conv_url=c["href"], **new)
+    return bool(rows)
 
 
 def ctx_paused(bot):
@@ -929,14 +998,18 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     l = Listing.from_dict(json.loads(r["data"]))
 
+    if r["status"] in DONE:  # an older card of an ad that has been sent since
+        await q.answer("Already sent")
+        try:
+            await q.edit_message_reply_markup(links_keyboard(l))
+        except BadRequest:  # a double tap: the buttons are already gone
+            pass
+        return
     if action == "skip":
         DB_.update(lid, status="skipped")
         await q.answer("Skipped")
         await q.edit_message_reply_markup(links_keyboard(l))
     elif action == "sent":  # sent by hand in the site's app
-        if r["status"] in ("sent", "replied", "already"):
-            await q.answer("Already logged")
-            return
         DB_.update(lid, status="sent", sent_at=time.time(), poster_id=l.poster_id or None)
         await q.answer("Logged as sent")
         await q.edit_message_reply_markup(links_keyboard(l))
@@ -958,9 +1031,6 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         await q.message.reply_text(prompt)
     elif action == "send":
-        if r["status"] in ("sent", "replied", "already"):
-            await q.answer("Already sent")
-            return
         if prev := DB_.same_person(l):
             await q.answer("Already contacted this person", show_alert=True)
             await q.message.reply_text(
@@ -1019,6 +1089,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     action, lid = pending
     r = DB_.get(lid)
+    if r["status"] in DONE:  # sent after you tapped Edit / Rewrite: keep the message that really went out
+        await update.message.reply_text("That ad has already been sent, so I left its message as it is.")
+        return
     text = update.message.text
     if action == "edit":
         draft = text
@@ -1141,7 +1214,7 @@ async def cmd_test(update: Update, ctx):
         await update.message.reply_text(str(e))
         return
     l = site.listing_from_url(ctx.args[0])
-    if (old := DB_.get(l.id)) and old["status"] in ("sent", "replied", "already"):  # keep what was really sent
+    if (old := DB_.get(l.id)) and old["status"] in DONE:  # keep what was really sent
         await update.message.reply_text(
             f"You already wrote to this ad (status: {old['status']}), so /test won't replace its draft and status."
         )
@@ -1163,9 +1236,9 @@ async def post_init(app: Application):
         paused=False, fails={}, n=0, counts={}, zeros={}, seeded={}, budget_warned={}, poll_lock=asyncio.Lock()
     )
     first = random.uniform(30, 90)
-    app.job_queue.run_once(tick, first, name="poll")
+    app.job_queue.run_once(tick, first, name="poll", job_kwargs=RUN_LATE)
     if CFG.get("replies", {}).get("enabled", True):
-        app.job_queue.run_once(inbox_tick, first + random.uniform(60, 180), name="inbox")
+        app.job_queue.run_once(inbox_tick, first + random.uniform(60, 180), name="inbox", job_kwargs=RUN_LATE)
     if hhmm := CFG["telegram"].get("daily_summary"):
         h, m = map(int, str(hhmm).split(":"))
         app.job_queue.run_daily(daily_summary, dtime(h, m, tzinfo=ZoneInfo("Europe/Berlin")), name="summary")
